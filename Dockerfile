@@ -1,6 +1,5 @@
 FROM php:8.2-cli
 
-# Install dependencies and PHP extension build requirements
 RUN apt-get update && apt-get install -y \
     libpq-dev \
     libsqlite3-dev \
@@ -10,12 +9,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy ONLY the PHP server files
 COPY server/ /app/
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8000/ || exit 1
+  CMD curl -f http://localhost:${PORT:-8000}/ || exit 1
 
-CMD ["php", "-S", "0.0.0.0:8000", "-t", "/app"]
+# Shell form (نه exec form) تا $PORT expand شود
+CMD php -S 0.0.0.0:${PORT:-8000} -t /app

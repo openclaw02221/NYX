@@ -3,15 +3,37 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.egg-info/
+dist/
+build/
+.eggs/
 venv/
-.env
+.venv/
 
-# Local Databases
+# Local databases
 *.sqlite
 *.db
+*.sqlite3
 
-# IDE & OS
+# Config with secrets
+.env
+*.local
+
+# IDE
 .idea/
 .vscode/
 *.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary
+*.bak
+*.tmp
+*.orig

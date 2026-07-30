@@ -1,126 +1,118 @@
 """
-main.py — NYX Messenger interactive REPL entry point.
+NYX Client entry point.
 
-Features:
-  • First-run wizard (server URL, identity, registration)
-  • prompt_toolkit line editing with history
-  • Background auto-sync thread (configurable interval)
-  • Smart input parsing: commands start with '/', bare text → send to active contact
-  • Irssi/WeeChat-style active-contact chat with status bar
-  • Thread-safe message display via queue + prompt_toolkit
-  • Contact aliases and theme system
-  • Session-only message display (no plaintext persistence)
-
-Usage:
-    python main.py               # Start the REPL
-    python main.py --server URL  # Override the server URL
-    python main.py --no-sync     # Disable background auto-sync
+Whitepaper sections 56 / 47: Python client architecture.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
-from nyx_client import config
-from nyx_client import crypto
-from nyx_client import ui
-from nyx_client.core import app, commands
-from nyx_client.storage import NYXDatabase
-from nyx_client.ui.repl import run_repl
-from nyx_client.themes import ThemeManager
+from nyx_client import __version__, __whitepaper_version__
+from nyx_client.config import configure_logging, get_logger, load_settings
+from nyx_client.core.app import NyxApp
+from nyx_client.ui.repl import ReplUI
 
 
-def main() -> None:
-    """Entry point for the NYX Messenger REPL."""
-    parser = argparse.ArgumentParser(
-        description="NYX Messenger — End-to-end encrypted messaging client",
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="nyx", description="NYX Client")
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--repl", action="store_true", help="interactive REPL")
+    parser.add_argument("--tui", action="store_true", help="curses terminal UI")
+    parser.add_argument(
+        "--profile-key-file",
+        type=Path,
+        default=None,
+        help="32-byte profile key file (dev)",
     )
     parser.add_argument(
-        "--server", "-s",
-        help="Server URL (overrides config / wizard)",
+        "--data-dir",
+        type=Path,
+        default=None,
+        help="override data directory",
     )
-    parser.add_argument(
-        "--no-sync",
-        action="store_true",
-        help="Disable background auto-sync",
-    )
-    parser.add_argument(
-        "--no-color",
-        action="store_true",
-        help="Disable coloured output",
-    )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    # ── Colour mode ────────────────────────────────────────────────
-    # ui already defaults to no_color=True, plain text output.
-    # This avoids raw ANSI codes showing as text on Arch Linux terminals.
-    # If --no-color is explicitly passed, keep the already-set no_color mode.
+    if args.version:
+        print("nyx-client " + __version__ + " (whitepaper " + __whitepaper_version__ + ")")
+        return 0
 
-    # ── Initialize configuration ───────────────────────────────────
-    cfg = config.NYXConfig()
-    first_run = not cfg.exists()
-    cfg.load()
-    cfg.ensure_defaults()
+    configure_logging(level="INFO", json_logs=False)
 
-    if args.server:
-        url = args.server.strip().rstrip("/")
-        cfg.set("server_url", url)
+    try:
+        settings = load_settings()
+    except (ValueError, OSError) as exc:
+        print("error: configuration: " + str(exc), file=sys.stderr)
+        return 1
 
-    # ── Theme ──────────────────────────────────────────────────────
-    app.theme_manager = ThemeManager(cfg.theme)
-    commands.set_theme_manager(app.theme_manager)
-
-    # ── Initialize database ────────────────────────────────────────
-    local_db = NYXDatabase(cfg.db_path)
-
-    # ── Initialize cryptographic identity ──────────────────────────
-    crypto_engine = crypto.NYXCrypto(
-        device_id_path=str(config.NYX_HOME / "device_id"),
-        keys_path=str(config.NYX_HOME / "keys"),
-    )
-
-    # ── First-run wizard ───────────────────────────────────────────
-    if first_run and not args.server:
-        ok = ui.run_first_run_wizard(
-            cfg,
-            local_db,
-            crypto_engine,
-            register_fn=lambda c, d, e: commands.register(c, d, e, quiet=True),
-            tm=app.theme_manager,
+    if args.data_dir is not None:
+        # Rebuild storage section with override via a simple approach:
+        from dataclasses import replace
+        from nyx_client.config.settings import StorageSettings
+        settings = replace(
+            settings,
+            storage=StorageSettings(
+                data_dir=str(args.data_dir),
+                db_filename=settings.storage.db_filename,
+            ),
+            data_dir=args.data_dir.resolve(),
         )
-        if not ok:
-            sys.exit(1)
-        # Reload theme in case wizard set it
-        app.theme_manager.set_theme(cfg.theme)
-    else:
-        # Returning user — show compact banner
-        ui.print_small_banner(app.theme_manager)
 
-        # Ensure identity exists
-        if not crypto_engine.has_identity():
-            ui.print_info("No local identity found. Generating...", app.theme_manager)
-            crypto_engine.generate_identity()
+    profile_key = None
+    if args.profile_key_file is not None:
+        profile_key = args.profile_key_file.read_bytes()
 
-        # Auto-register if needed
-        if not local_db.is_registered():
-            ui.print_info("Registering with server...", app.theme_manager)
-            commands.register(cfg, local_db, crypto_engine)
+    try:
+        app = NyxApp.from_settings(settings=settings, profile_key=profile_key)
+        identity = app.start()
+    except Exception as exc:
+        print("error: " + str(exc), file=sys.stderr)
+        return 1
 
-        # Connection status line
-        ui.print_info(f"Server: {cfg.server_url}", app.theme_manager)
-        if crypto_engine.device_id:
-            ui.print_info(
-                f"Identity: {crypto_engine.device_id}", app.theme_manager
-            )
+    if app.last_mnemonic:
+        print()
+        print("  *** NEW IDENTITY CREATED ***")
+        print("  " + identity.id)
+        print()
+        print("  Recovery mnemonic (store offline, never share):")
+        print("  " + app.last_mnemonic)
         print()
 
-    # ── Run the REPL ───────────────────────────────────────────────
-    try:
-        run_repl(cfg, local_db, crypto_engine, no_sync=args.no_sync)
-    finally:
-        local_db.close()
+    if args.tui:
+        try:
+            from nyx_client.ui.pro_tui import ProTUI as PanelApp
+        except ImportError:
+            print("error: curses not available; pip install windows-curses", file=sys.stderr)
+            print("or use --repl", file=sys.stderr)
+            app.stop()
+            return 1
+        code = PanelApp(app).run()
+        app.stop()
+        return code
+
+    if args.repl:
+        ui = ReplUI(app.command_context())
+        code = ui.run()
+        app.stop()
+        return code
+
+    print()
+    print("  +------------------------------------------+")
+    print("  |          NYX Client  v" + __version__.ljust(18) + "|")
+    print("  |  Whitepaper v" + __whitepaper_version__.ljust(27) + "|")
+    print("  +------------------------------------------+")
+    print()
+    print("  Identity: " + identity.id)
+    print("  Data    : " + str(app.settings.data_dir))
+    print("  Server  : " + app.settings.network.default_server)
+    print()
+    print("  Run with --repl for interactive mode.")
+    print()
+    app.stop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

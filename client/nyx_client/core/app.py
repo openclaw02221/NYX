@@ -1,408 +1,400 @@
 """
-app.py — Application state and lifecycle for the NYX Messenger client.
+Application facade — wires all layers into a single lifecycle object.
 
-Holds global runtime state (active contact, sync thread, message queue)
-and provides the command dispatcher used by the REPL.
+This is the object the UI and CLI talk to. It owns:
+  - Settings
+  - Database / stores
+  - Identity (loaded or created)
+  - MessagingService
+  - ConnectionManager (optional)
+  - CommandContext
+
+Whitepaper alignment: clean layer boundaries, single entry for startup/shutdown.
 """
 
 from __future__ import annotations
 
-import os
-import threading
-import traceback
-from collections import deque
+from pathlib import Path
 from typing import Optional
 
-from nyx_client import config
-from nyx_client import crypto
-from nyx_client import ui
-from nyx_client.core import commands
-from nyx_client.storage import NYXDatabase
-from nyx_client.themes import ThemeManager
+from nyx_client.config.settings import Settings, load_settings, ensure_directories
+from nyx_client.config.logging import configure_logging, get_logger
+from nyx_client.crypto import Identity, create_recoverable_identity
+from nyx_client.crypto.aead import generate_key
+from nyx_client.storage import Database, ProfileStore, MessageStore, ContactStore
+from nyx_client.storage.rooms import RoomStore, Room
+from nyx_client.storage.user_prefs import UserPrefs
+from nyx_client.core.search import SearchService
+from nyx_client.core.directory import Directory, PublicProfile
+from nyx_client.core.messaging import MessagingService
+from nyx_client.core.commands import CommandContext, registry, CommandResult
+from nyx_client.protocol.connection import ConnectionManager, MockTransport
+from nyx_client.protocol.http_transport import HttpTransport
+from nyx_client.protocol.discovery import ServerDirectory, ServerInfo
+from nyx_client.update.updater import UpdateClient, UpdateCheckResult
 
-# ── Global state ───────────────────────────────────────────────────────────
-running = True
-sync_thread: Optional[threading.Thread] = None
-active_contact: Optional[str] = None     # resolved device_id of active chat
-active_contact_display: Optional[str] = None  # alias or short device_id
-theme_manager: Optional[ThemeManager] = None
-# Event used to wake the sync thread early when interval/settings change
-sync_wake = threading.Event()
-
-# Thread-safe message queue for sync thread → main thread communication.
-# Using a deque with a lock ensures prompt_toolkit never prints from a
-# background thread without coordination.
-_message_queue: deque = deque()
-_message_lock = threading.Lock()
-
-# Track displayed messages by timestamp+content hash to avoid duplicates
-# when a manual sync overlaps with auto-sync.
-_displayed_hashes: set = set()
+log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Background sync helpers
-# ---------------------------------------------------------------------------
+class NyxApp:
+    """Process-level application object."""
 
-def push_message(timestamp: str, sender: str, content: str, is_you: bool) -> None:
-    """Push a chat message onto the thread-safe queue for main-thread display."""
-    msg_hash = hash((timestamp, sender, content, is_you))
-    with _message_lock:
-        if msg_hash not in _displayed_hashes:
-            _displayed_hashes.add(msg_hash)
-            _message_queue.append((timestamp, sender, content, is_you))
+    def __init__(self, settings: Settings, profile_key: bytes) -> None:
+        self.settings = settings
+        self._profile_key = profile_key
+        self.db = Database(settings.storage.database_path())
+        self.identity: Optional[Identity] = None
+        self.messaging: Optional[MessagingService] = None
+        self.contacts: Optional[ContactStore] = None
+        self.messages: Optional[MessageStore] = None
+        self.connection: Optional[ConnectionManager] = None
+        self._profile: Optional[ProfileStore] = None
+        self._started = False
+        self.last_mnemonic: Optional[str] = None
+        self.directory: Optional[ServerDirectory] = None
+        self.updater: Optional[UpdateClient] = None
+        self.rooms: Optional[RoomStore] = None
+        self.search: Optional[SearchService] = None
+        self.prefs: Optional[UserPrefs] = None
+        self.user_directory: Optional[Directory] = None
+        self.is_new_identity: bool = False
 
-
-def flush_message_queue() -> None:
-    """
-    Called from the main REPL loop to display any queued messages.
-    This runs on the main thread, safe for prompt_toolkit.
-    Uses plain print() because we're inside patch_stdout().
-    """
-    with _message_lock:
-        while _message_queue:
-            ts, sender, content, is_you = _message_queue.popleft()
-            line = f"[{ts}] "
-            if is_you:
-                line += f"You: {content}"
-            else:
-                line += f"{sender}: {content}"
-            print(line)
-
-
-def background_sync(
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-) -> None:
-    """
-    Background thread: pulls new messages periodically and queues them
-    for thread-safe display on the main REPL loop.
-
-    Uses a message queue + main-thread flush to avoid garbling the
-    prompt_toolkit input line.
-    """
-    global running
-
-    while running:
-        try:
-            if cfg.auto_sync:
-                since = local_db.get_last_sync_time()
-                result = commands.sync_messages(
-                    cfg,
-                    local_db,
-                    crypto_engine,
-                    since=since,
-                    quiet=True,       # no "No new messages" spam
-                    notify=False,     # we handle display via queue
-                    push_fn=push_message,  # thread-safe queue callback
-                )
-                if result and result.get("messages"):
-                    last_times = [
-                        m.get("created_at", "")
-                        for m in result["messages"]
-                        if m.get("created_at")
-                    ]
-                    if last_times:
-                        local_db.set_last_sync_time(max(last_times))
-        except Exception:
-            # Never crash the REPL from the sync thread
-            if os.environ.get("NYX_DEBUG"):
-                traceback.print_exc()
-
-        # Sleep in small slices so we can exit promptly and react to
-        # interval changes / wake events.
-        interval = cfg.sync_interval
-        slices = max(1, int(interval * 10))
-        for _ in range(slices):
-            if not running:
-                return
-            if sync_wake.wait(timeout=0.1):
-                sync_wake.clear()
-                break
-
-
-# ---------------------------------------------------------------------------
-# Smart command dispatcher
-# ---------------------------------------------------------------------------
-
-def process_command(
-    line: str,
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-) -> bool:
-    """
-    Smart input parser:
-      - Lines starting with '/' → command dispatcher
-      - Bare text with active_contact → auto-send to active contact
-      - Bare text without active_contact → show helpful message
-
-    Returns False if the user wants to quit.
-    """
-    global running, active_contact, active_contact_display
-
-    stripped = line.strip()
-    if not stripped:
-        return True
-
-    # ── SMART PARSING ──
-    # CASE 1: Input starts with '/' → it's a command
-    if stripped.startswith("/"):
-        return handle_command(
-            stripped, cfg, local_db, crypto_engine
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Optional[Settings] = None,
+        profile_key: Optional[bytes] = None,
+        profile_key_path: Optional[Path] = None,
+    ) -> "NyxApp":
+        if settings is None:
+            settings = load_settings()
+        ensure_directories(settings)
+        configure_logging(
+            level=settings.logging.level,
+            json_logs=settings.logging.json_logs,
         )
-
-    # CASE 2: Input does NOT start with '/', and we have an active contact
-    #         → auto-send as a message
-    if active_contact:
-        commands.send_message(
-            cfg, local_db, crypto_engine, active_contact, stripped
-        )
-        return True
-
-    # CASE 3: Input does NOT start with '/', no active contact
-    #         → tell the user how to start chatting
-    ui.print_info(
-        "No active chat. Use '/switch <contact>' to start chatting, "
-        "or type '/help'.",
-        theme_manager,
-    )
-    return True
-
-
-def handle_command(
-    stripped: str,
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-) -> bool:
-    """
-    Parse and execute a command string (already confirmed to start with '/').
-    """
-    global running, active_contact, active_contact_display
-
-    # Strip the leading '/'
-    cmd_text = stripped[1:].lstrip()
-    if not cmd_text:
-        return True
-
-    parts = cmd_text.split(maxsplit=1)
-    cmd = parts[0].lower()
-    args = parts[1] if len(parts) > 1 else ""
-
-    try:
-        if cmd in ("quit", "exit", "q"):
-            ui.print_info("Goodbye. Stay encrypted.", theme_manager)
-            running = False
-            return False
-
-        elif cmd in ("help", "?"):
-            commands.show_help()
-
-        elif cmd == "register":
-            commands.register(cfg, local_db, crypto_engine)
-
-        elif cmd == "myid":
-            commands.show_my_id(crypto_engine)
-
-        elif cmd == "sync":
-            commands.handle_sync_command(cfg, local_db, crypto_engine, args)
-            sync_wake.set()
-
-        elif cmd == "send":
-            if not args:
-                ui.print_error(
-                    "Usage: /send <contact> <message>", theme_manager
-                )
-            else:
-                send_parts = args.split(maxsplit=1)
-                if len(send_parts) < 2:
-                    ui.print_error(
-                        "Usage: /send <contact> <message>", theme_manager
-                    )
-                else:
-                    commands.send_message(
-                        cfg, local_db, crypto_engine,
-                        send_parts[0], send_parts[1],
-                    )
-
-        elif cmd in ("switch", "chat"):
-            if not args:
-                if active_contact:
-                    ui.print_info(
-                        f"Active contact: {active_contact_display} "
-                        f"({active_contact})",
-                        theme_manager,
-                    )
-                else:
-                    ui.print_info(
-                        "No active contact. "
-                        "Usage: /switch <alias_or_id>",
-                        theme_manager,
-                    )
-            else:
-                name = args.strip()
-                if name.lower() in ("none", "off", "-"):
-                    active_contact = None
-                    active_contact_display = None
-                    ui.print_success("Active contact cleared.", theme_manager)
-                else:
-                    resolved = local_db.resolve_contact(name)
-                    if not resolved:
-                        ui.print_error(
-                            f"Unknown contact: {name}", theme_manager
-                        )
-                    else:
-                        active_contact = resolved
-                        active_contact_display = local_db.display_name(resolved)
-                        ui.print_success(
-                            f"Now chatting with {active_contact_display} "
-                            f"({resolved})",
-                            theme_manager,
-                        )
-                        ui.print_info(
-                            "Just type your message and press Enter "
-                            "to send (no '/send' needed).",
-                            theme_manager,
-                        )
-
-        elif cmd == "contacts":
-            sort_by = "id"
-            if args:
-                a = args.strip().lower().replace("=", " ").split()
-                if "--sort" in a:
-                    idx = a.index("--sort")
-                    if idx + 1 < len(a):
-                        sort_by = a[idx + 1]
-                elif a[0] in ("alias", "id"):
-                    sort_by = a[0]
-                if sort_by not in ("id", "alias"):
-                    ui.print_error(
-                        "Sort must be 'id' or 'alias'.", theme_manager
-                    )
-                    sort_by = "id"
-            commands.list_contacts(local_db, sort_by=sort_by)
-
-        elif cmd == "import":
-            if not args:
-                ui.print_error(
-                    "Usage: /import <public_key>", theme_manager
-                )
-            else:
-                commands.import_contact(local_db, args.strip())
-
-        elif cmd == "alias":
-            if not args:
-                ui.print_error(
-                    "Usage: /alias <device_id> <new_alias>", theme_manager
-                )
-            else:
-                alias_parts = args.split(maxsplit=1)
-                if len(alias_parts) < 2:
-                    ui.print_error(
-                        "Usage: /alias <device_id> <new_alias>",
-                        theme_manager,
-                    )
-                    ui.print_info(
-                        "Use an empty alias string to clear: "
-                        "/alias <device_id> \"\"",
-                        theme_manager,
-                    )
-                else:
-                    commands.set_alias(
-                        local_db, alias_parts[0], alias_parts[1].strip('"')
-                    )
-                    if active_contact == local_db.resolve_contact(alias_parts[0]):
-                        active_contact_display = (
-                            local_db.display_name(active_contact)
-                            if active_contact else None
-                        )
-
-        elif cmd == "theme":
-            commands.handle_theme_command(cfg, args)
-
-        elif cmd == "config":
-            if not args:
-                print()
-                print("Configuration")
-                for key in ("server_url", "auto_sync", "sync_interval", "theme"):
-                    print(f"  {key}: {cfg.get(key)}")
-                print()
-            else:
-                cfg_parts = args.split(maxsplit=1)
-                if len(cfg_parts) == 2:
-                    commands.set_config(cfg, cfg_parts[0], cfg_parts[1])
-                    sync_wake.set()
-                else:
-                    ui.print_error(
-                        "Usage: /config <key> <value>", theme_manager
-                    )
-                    ui.print_info(
-                        "Keys: server_url, auto_sync, sync_interval, theme",
-                        theme_manager,
-                    )
-
-        elif cmd == "server":
-            if not args:
-                ui.print_info(
-                    f"Server URL: {cfg.server_url}", theme_manager
-                )
-            else:
-                url = args.strip().rstrip("/")
-                if not (url.startswith("http://") or url.startswith("https://")):
-                    ui.print_error(
-                        "URL must start with http:// or https://",
-                        theme_manager,
-                    )
-                else:
-                    cfg.set("server_url", url)
-                    ui.print_success(
-                        f"Server URL set to: {url}", theme_manager
-                    )
-
-        elif cmd == "clear":
-            os.system("clear" if os.name != "nt" else "cls")
-            if theme_manager:
-                ui.print_small_banner(theme_manager)
-                ui.print_status_bar(
-                    active_contact=active_contact_display,
-                    auto_sync=cfg.auto_sync,
-                    sync_interval=cfg.sync_interval,
-                    theme_name=cfg.theme,
-                    connected=True,
-                    tm=theme_manager,
-                )
-
-        elif cmd == "debug":
-            commands.show_debug_info(crypto_engine, local_db, cfg)
-            if active_contact:
-                ui.print_info(
-                    f"Active contact: {active_contact_display} ({active_contact})",
-                    theme_manager,
-                )
-
-        elif cmd == "status":
-            ui.print_status_bar(
-                active_contact=active_contact_display,
-                auto_sync=cfg.auto_sync,
-                sync_interval=cfg.sync_interval,
-                theme_name=cfg.theme,
-                connected=True,
-                tm=theme_manager,
+        key = profile_key
+        if key is None:
+            key = cls._load_or_create_profile_key(
+                profile_key_path or (settings.data_dir / ".profile_key")
             )
+        return cls(settings, key)
 
+    @staticmethod
+    def _load_or_create_profile_key(path: Path) -> bytes:
+        if path.is_file():
+            data = path.read_bytes()
+            if len(data) != 32:
+                raise ValueError("profile key file must be exactly 32 bytes")
+            return data
+        key = generate_key()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(key)
+        path.chmod(0o600)
+        return key
+
+    def start(self) -> Identity:
+        """Open DB, load/create identity, wire services. Idempotent."""
+        if self._started:
+            assert self.identity is not None
+            return self.identity
+
+        self.db.connect()
+        self._profile = ProfileStore(self.db, self._profile_key)
+        self.messages = MessageStore(self.db)
+        self.contacts = ContactStore(self.db)
+        self.rooms = RoomStore(self.db)
+        self.prefs = UserPrefs(self.db)
+        self.search = SearchService(self.contacts, self.rooms, self.messages)
+        self.user_directory = Directory(self.contacts, self.prefs)
+
+        if self._profile.has_profile():
+            identity = self._profile.load_identity()
+            if identity is None:
+                raise RuntimeError("corrupt profile: decrypt returned None")
+            self.last_mnemonic = None
+            self.is_new_identity = False
         else:
-            ui.print_error(f"Unknown command: /{cmd}", theme_manager)
-            ui.print_info(
-                "Type '/help' for a list of commands.", theme_manager
+            bundle = create_recoverable_identity()
+            self._profile.save_identity(bundle.identity, recovery_seed=bundle.seed)
+            identity = bundle.identity
+            self.last_mnemonic = bundle.mnemonic_phrase()
+            self.is_new_identity = True
+            log.info("app.identity_created", identity=identity.id)
+
+        self.identity = identity
+        if self.user_directory is not None:
+            self.user_directory.set_self(identity.id, self.prefs)
+        self.messaging = MessagingService(
+            identity, self.messages, self.contacts
+        )
+        self.directory = ServerDirectory(self.settings.data_dir)
+        # Optional preferred server from config
+        pref = self.settings.network.default_server
+        if pref:
+            from nyx_client.protocol.discovery import ServerInfo
+            self.directory.upsert(
+                ServerInfo(id="config-default", endpoint=pref, trust_level=1, source="config")
             )
+            self.directory.save()
 
-    except KeyboardInterrupt:
-        print("\nCommand interrupted.")
-    except Exception as e:
-        ui.print_error(f"{e}", theme_manager)
-        if os.environ.get("NYX_DEBUG"):
-            traceback.print_exc()
+        release_keys = self._load_release_keys()
+        self.updater = UpdateClient(
+            data_dir=self.settings.data_dir,
+            channel=self.settings.updates.channel,
+            github_manifest_url=getattr(
+                self.settings.updates, "github_manifest_url", ""
+            ) or "",
+            release_public_keys=release_keys,
+            auto_install=self.settings.updates.auto_install,
+            current_version=__import__("nyx_client", fromlist=["__version__"]).__version__,
+        )
+        # Extra bootstrap servers from config
+        for ep in getattr(self.settings.network, "bootstrap_servers", ()) or ():
+            if ep:
+                self.directory.upsert(
+                    ServerInfo(
+                        id="bootstrap-" + str(ep)[:24],
+                        endpoint=str(ep),
+                        trust_level=1,
+                        source="config",
+                    )
+                )
+        self.directory.save()
+        self._started = True
+        log.info("app.started", identity=identity.id)
+        return identity
 
-    return True
+    def connect_mock(self) -> None:
+        """Attach a MockTransport connection (for tests / offline demo)."""
+        if self.identity is None:
+            raise RuntimeError("call start() first")
+        transport = MockTransport()
+        self.connection = ConnectionManager(
+            self.identity, self.settings.network, transport=transport
+        )
+        if self.messaging is not None:
+            self.messaging._connection = self.connection  # noqa: SLF001
+
+    def command_context(self) -> CommandContext:
+        if self.identity is None:
+            raise RuntimeError("call start() first")
+        connected = bool(
+            self.connection
+            and self.connection.session
+            and self.connection.session.is_authenticated()
+        )
+        return CommandContext(
+            identity_id=self.identity.id,
+            server=self.settings.network.default_server,
+            connected=connected,
+            services={
+                "messaging": self.messaging,
+                "contacts": self.contacts,
+                "app": self,
+            },
+        )
+
+    def dispatch(self, line: str) -> CommandResult:
+        return registry.dispatch(self.command_context(), line)
+
+    def refresh_servers(self, probe: bool = True) -> list:
+        """Probe known servers and optionally pull discovery lists from reachable ones."""
+        if self.directory is None:
+            raise RuntimeError("call start() first")
+        if probe:
+            self.directory.probe_all(
+                timeout=float(self.settings.network.connection_timeout)
+            )
+        # Ask top reachable relays for more servers
+        for s in self.directory.ranked(only_reachable=True)[:3]:
+            try:
+                self.directory.fetch_from_relay(
+                    s.endpoint, timeout=float(self.settings.network.connection_timeout)
+                )
+            except Exception:
+                pass
+        if probe:
+            self.directory.probe_all(
+                timeout=float(self.settings.network.connection_timeout)
+            )
+        return self.directory.ranked()
+
+    def select_best_server(self) -> Optional[str]:
+        if self.directory is None:
+            return self.settings.network.default_server
+        best = self.directory.best(min_trust=self.settings.security.min_trust_level)
+        if best:
+            return best.endpoint
+        return self.settings.network.default_server
+
+    async def connect_best(self, use_http: bool = True):
+        """Connect to the highest-scoring reachable relay."""
+        if self.identity is None:
+            raise RuntimeError("call start() first")
+        endpoint = self.select_best_server()
+        transport = HttpTransport(verify_tls=self.settings.security.pin_tls_certificates) if use_http else MockTransport()
+        self.connection = ConnectionManager(
+            self.identity, self.settings.network, transport=transport
+        )
+        if self.messaging is not None:
+            self.messaging._connection = self.connection
+        return await self.connection.connect(endpoint)
+
+    def _load_release_keys(self) -> dict:
+        """Load {key_id: raw 32-byte Ed25519 public key} from JSON hex map."""
+        path_str = getattr(self.settings.updates, "release_keys_file", "") or ""
+        if not path_str:
+            return {}
+        path = Path(path_str).expanduser()
+        if not path.is_file():
+            log.warning("update.keys_file_missing", path=str(path))
+            return {}
+        try:
+            import json
+            data = json.loads(path.read_text())
+            out = {}
+            for kid, hex_key in data.items():
+                raw = bytes.fromhex(hex_key) if isinstance(hex_key, str) else bytes(hex_key)
+                if len(raw) == 32:
+                    out[str(kid)] = raw
+            return out
+        except Exception as exc:
+            log.warning("update.keys_load_failed", error=str(exc))
+            return {}
+
+    def fetch_relay_update_manifest(self, endpoint: Optional[str] = None) -> Optional[dict]:
+        import json
+        import urllib.request
+        from nyx_client.protocol.discovery import normalize_endpoint
+        ep = endpoint or self.select_best_server()
+        if not ep:
+            return None
+        base = normalize_endpoint(ep).rstrip("/")
+        url = base + "/api/v3/updates/manifest"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json", "User-Agent": "nyx-client/0.2.0"},
+            )
+            with urllib.request.urlopen(
+                req, timeout=float(self.settings.network.connection_timeout)
+            ) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as exc:
+            log.debug("update.relay_manifest_fetch_failed", error=str(exc))
+            return None
+
+    def check_updates(self, relay_manifest: Optional[dict] = None) -> UpdateCheckResult:
+        if self.updater is None:
+            raise RuntimeError("call start() first")
+        manifest = relay_manifest
+        if manifest is None:
+            try:
+                manifest = self.fetch_relay_update_manifest()
+            except Exception:
+                manifest = None
+        return self.updater.check(
+            relay_manifest=manifest,
+            fetch_github=bool(self.updater.github_manifest_url),
+        )
+
+    def apply_update(self, manifest_dict: Optional[dict] = None) -> str:
+        if self.updater is None:
+            raise RuntimeError("call start() first")
+        result = self.check_updates(relay_manifest=manifest_dict)
+        if not result.update_available or result.candidate is None:
+            return "already-current:" + result.current_version
+        path = self.updater.download_and_verify(result.candidate)
+        self.updater.install(path, result.candidate)
+        return result.candidate.version
+
+    def connect_sync(self, endpoint: Optional[str] = None, use_http: bool = True):
+        import asyncio
+        if endpoint is None:
+            endpoint = self.select_best_server()
+
+        async def _run():
+            if self.identity is None:
+                raise RuntimeError("call start() first")
+            transport = (
+                HttpTransport(verify_tls=self.settings.security.pin_tls_certificates)
+                if use_http
+                else MockTransport()
+            )
+            self.connection = ConnectionManager(
+                self.identity, self.settings.network, transport=transport
+            )
+            if self.messaging is not None:
+                self.messaging._connection = self.connection
+            return await self.connection.connect(endpoint)
+
+        return asyncio.run(_run())
+
+    def create_group(self, title: str, description: str = "") -> Room:
+        if not self.identity or not self.rooms:
+            raise RuntimeError("not started")
+        return self.rooms.create(
+            room_type="private_group",
+            title=title,
+            description=description,
+            owner_id=self.identity.id,
+            is_public=False,
+        )
+
+    def create_channel(self, title: str, description: str = "", public: bool = True) -> Room:
+        if not self.identity or not self.rooms:
+            raise RuntimeError("not started")
+        return self.rooms.create(
+            room_type="public_channel" if public else "private_channel",
+            title=title,
+            description=description,
+            owner_id=self.identity.id,
+            is_public=public,
+        )
+
+    def update_room(
+        self,
+        room_id: str,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        is_public: Optional[bool] = None,
+    ) -> Room:
+        if not self.rooms:
+            raise RuntimeError("not started")
+        return self.rooms.update_settings(
+            room_id, title=title, description=description, is_public=is_public
+        )
+
+    def search_directory(self, query: str):
+        if not self.search:
+            raise RuntimeError("not started")
+        return self.search.search(query)
+
+
+    def get_user_profile(self, identity_id: str) -> PublicProfile:
+        if self.user_directory is None:
+            raise RuntimeError("not started")
+        return self.user_directory.profile(identity_id)
+
+    def set_contact_profile(
+        self,
+        identity_id: str,
+        display_name: Optional[str] = None,
+        bio: Optional[str] = None,
+    ) -> None:
+        if self.user_directory is None:
+            raise RuntimeError("not started")
+        self.user_directory.set_remote_profile(
+            identity_id, display_name=display_name, bio=bio
+        )
+
+    def stop(self) -> None:
+
+        if self.connection is not None:
+            # Best-effort sync disconnect mark
+            if self.connection.session:
+                self.connection.session.mark_disconnected("app_stop")
+        self.db.close()
+        self._started = False
+        log.info("app.stopped")

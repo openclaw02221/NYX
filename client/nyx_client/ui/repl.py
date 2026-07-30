@@ -1,97 +1,83 @@
 """
-repl.py — Interactive REPL loop for NYX Messenger.
+Terminal REPL UI for NYX (MVP).
 
-Uses prompt_toolkit with patch_stdout for safe background-sync display.
+Whitepaper Section 07: Terminal-first, keyboard-driven.
+Textual is preferred when available; this module provides a clean
+stdin/stdout REPL that works with zero extra dependencies and shares
+the same CommandRegistry so switching to Textual later is seamless.
 """
 
 from __future__ import annotations
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.patch_stdout import patch_stdout
+import sys
+from typing import Optional, TextIO
 
-from nyx_client import config
-from nyx_client import crypto
-from nyx_client import ui
-from nyx_client.core import app
-from nyx_client.storage import NYXDatabase
+from nyx_client.core.commands import CommandContext, CommandRegistry, registry
+from nyx_client.config.logging import get_logger
 
+log = get_logger(__name__)
 
-def build_prompt() -> str:
-    """Build the input prompt, reflecting the active contact if any."""
-    if app.active_contact_display:
-        return f"nyx({app.active_contact_display})> "
-    return "nyx> "
+BANNER = """
+  +------------------------------------------+
+  |          NYX Client  REPL                |
+  |  Type /help for commands, /exit to quit  |
+  +------------------------------------------+
+"""
 
 
-def run_repl(
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-    no_sync: bool = False,
-) -> None:
-    """
-    Main REPL loop using prompt_toolkit with patch_stdout for background sync.
+class ReplUI:
+    """Simple line-oriented terminal interface."""
 
-    The patch_stdout() context manager ensures that all print() calls
-    (including from the background sync thread) are rendered safely
-    without corrupting the prompt_toolkit input line.
-    """
-    import threading
+    def __init__(
+        self,
+        ctx: CommandContext,
+        commands: Optional[CommandRegistry] = None,
+        stdin: Optional[TextIO] = None,
+        stdout: Optional[TextIO] = None,
+    ) -> None:
+        self.ctx = ctx
+        self.commands = commands or registry
+        self.stdin = stdin or sys.stdin
+        self.stdout = stdout or sys.stdout
 
-    history_path = config.NYX_HOME / ".nyx_history"
-    config.NYX_HOME.mkdir(parents=True, exist_ok=True)
+    def print(self, text: str) -> None:
+        self.stdout.write(text + "\n")
+        self.stdout.flush()
 
-    prompt_session: PromptSession = PromptSession(
-        history=FileHistory(str(history_path)),
-    )
+    def run_line(self, line: str) -> bool:
+        """
+        Process one input line.
 
-    # Start background sync thread unless disabled
-    if not no_sync:
-        app.sync_thread = threading.Thread(
-            target=app.background_sync,
-            args=(cfg, local_db, crypto_engine),
-            daemon=True,
-            name="nyx-sync",
-        )
-        app.sync_thread.start()
+        Returns False if the REPL should exit.
+        """
+        result = self.commands.dispatch(self.ctx, line)
+        if result.message == "__EXIT__":
+            self.print("Goodbye.")
+            return False
+        if result.message:
+            prefix = "" if result.ok else "error: "
+            self.print(prefix + result.message)
+        return True
 
-    # Status bar once at start
-    ui.print_status_bar(
-        active_contact=app.active_contact_display,
-        auto_sync=cfg.auto_sync and not no_sync,
-        sync_interval=cfg.sync_interval,
-        theme_name=cfg.theme,
-        connected=True,
-        tm=app.theme_manager,
-    )
-    print()
-    if not app.active_contact:
-        ui.print_info(
-            "Use '/switch <contact>' to start chatting, "
-            "or type '/help'.",
-            app.theme_manager,
-        )
-        print()
-
-    with patch_stdout():
-        while app.running:
+    def run(self) -> int:
+        """Interactive loop. Returns process exit code."""
+        self.print(BANNER)
+        if self.ctx.identity_id:
+            self.print("  Identity: " + self.ctx.identity_id)
+        self.print("")
+        while True:
             try:
-                # Flush any queued messages before showing the prompt
-                app.flush_message_queue()
-
-                line = prompt_session.prompt(build_prompt())
-                if not app.process_command(line, cfg, local_db, crypto_engine):
+                self.stdout.write("nyx> ")
+                self.stdout.flush()
+                line = self.stdin.readline()
+                if line == "":
+                    self.print("")
+                    break
+                if not self.run_line(line):
                     break
             except KeyboardInterrupt:
-                print()  # move past ^C
-                continue
+                self.print("\n(interrupted — type /exit to quit)")
             except EOFError:
-                print()
-                ui.print_info("Goodbye. Stay encrypted.", app.theme_manager)
+                self.print("")
                 break
-
-    app.running = False
-    app.sync_wake.set()
-    if app.sync_thread and app.sync_thread.is_alive():
-        app.sync_thread.join(timeout=2)
+        return 0

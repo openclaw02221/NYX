@@ -1,63 +1,14 @@
 """
-ui — Terminal UI components for NYX Messenger.
+Presentation layer — REPL + professional multi-panel TUI.
 """
 
-from nyx_client.ui.display import (
-    NYX_BANNER,
-    NYX_BANNER_SMALL,
-    SPINNER_FRAMES,
-    STATUS_CONNECTED,
-    STATUS_DISCONNECTED,
-    STATUS_SYNCING,
-    console,
-    format_chat_message,
-    format_status_bar,
-    format_timestamp,
-    message_separator,
-    notify_new_message,
-    play_beep,
-    print_banner,
-    print_chat_message,
-    print_contacts_table,
-    print_error,
-    print_info,
-    print_small_banner,
-    print_status,
-    print_status_bar,
-    print_success,
-    print_warning,
-    run_first_run_wizard,
-    show_desktop_notification,
-    spin_while,
-    test_server_connection,
-)
+from nyx_client.ui.repl import ReplUI
 
-__all__ = [
-    "console",
-    "NYX_BANNER",
-    "NYX_BANNER_SMALL",
-    "SPINNER_FRAMES",
-    "STATUS_CONNECTED",
-    "STATUS_DISCONNECTED",
-    "STATUS_SYNCING",
-    "print_banner",
-    "print_small_banner",
-    "print_status",
-    "print_error",
-    "print_success",
-    "print_info",
-    "print_warning",
-    "message_separator",
-    "format_timestamp",
-    "format_chat_message",
-    "print_chat_message",
-    "play_beep",
-    "show_desktop_notification",
-    "notify_new_message",
-    "print_contacts_table",
-    "test_server_connection",
-    "spin_while",
-    "run_first_run_wizard",
-    "format_status_bar",
-    "print_status_bar",
-]
+__all__ = ["ReplUI"]
+
+try:
+    from nyx_client.ui.pro_tui import ProTUI, PanelApp
+    __all__ += ["ProTUI", "PanelApp"]
+except ImportError:
+    ProTUI = None  # type: ignore
+    PanelApp = None  # type: ignore

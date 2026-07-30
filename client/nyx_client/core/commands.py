@@ -1,395 +1,377 @@
-"""
-commands.py — Command implementations for the NYX Messenger REPL.
-
-Each function performs one user action (register, send, sync, etc.).
-All errors are printed locally and never raise out of the REPL.
-No sys.exit() calls — the REPL must keep running.
-
-Messages are displayed in real-time but NOT persisted to the database
-(session-only chat history by design).
-"""
+"""Command system for the NYX client. Whitepaper Section 09."""
 
 from __future__ import annotations
 
-import hashlib
-from typing import Any, Dict, Optional
+import shlex
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
-from nyx_client import config
-from nyx_client import crypto
-from nyx_client import ui
-from nyx_client.core import messaging
-from nyx_client.storage import NYXDatabase
-from nyx_client.themes import ThemeManager, THEMES
+from nyx_client.config.logging import get_logger
 
-# ---------------------------------------------------------------------------
-# Theme manager injection (delegates to messaging module for shared state)
-# ---------------------------------------------------------------------------
-
-def set_theme_manager(tm: ThemeManager) -> None:
-    """Inject the shared ThemeManager used for styled output."""
-    messaging.set_theme_manager(tm)
+log = get_logger(__name__)
 
 
-def _tm_or_default() -> ThemeManager:
-    return messaging._tm_or_default()
+@dataclass
+class CommandContext:
+    identity_id: Optional[str] = None
+    server: Optional[str] = None
+    connected: bool = False
+    services: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Output helpers (delegate to messaging / ui)
-# ---------------------------------------------------------------------------
-
-def _error(msg: str) -> None:
-    messaging._error(msg)
-
-
-def _info(msg: str) -> None:
-    messaging._info(msg)
+@dataclass
+class CommandResult:
+    ok: bool
+    message: str
+    data: Optional[Any] = None
 
 
-def _success(msg: str) -> None:
-    messaging._success(msg)
+CommandHandler = Callable[[CommandContext, List[str]], CommandResult]
 
 
-def _warning(msg: str) -> None:
-    messaging._warning(msg)
+@dataclass
+class CommandSpec:
+    name: str
+    handler: CommandHandler
+    help: str
+    usage: str = ""
 
 
-# Re-export messaging functions so callers can use commands.sync_messages etc.
-sync_messages = messaging.sync_messages
-send_message = messaging.send_message
-get_session_messages = messaging.get_session_messages
-clear_session_messages = messaging.clear_session_messages
+class CommandRegistry:
+    def __init__(self) -> None:
+        self._commands: Dict[str, CommandSpec] = {}
 
+    def register(self, name: str, help: str, usage: str = ""):
+        def decorator(fn: CommandHandler) -> CommandHandler:
+            self._commands[name] = CommandSpec(
+                name=name, handler=fn, help=help, usage=usage or ("/" + name)
+            )
+            return fn
+        return decorator
 
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
+    def get(self, name: str) -> Optional[CommandSpec]:
+        return self._commands.get(name)
 
-def show_help() -> None:
-    """Print the help screen in plain text."""
-    print()
-    print("=== NYX Commands ===")
-    print()
-    help_lines = [
-        ("/help", "Show this help message"),
-        ("/switch <contact>", "Set active chat target (alias or device ID)"),
-        ("/chat <contact>", "Alias for /switch"),
-        ("/contacts", "List known contacts"),
-        ("/contacts --sort alias|id", "List contacts sorted by alias or device ID"),
-        ("/send <contact> <msg>", "Send an encrypted message directly"),
-        ("/sync", "Pull new messages from the server (manual)"),
-        ("/sync on|off", "Enable / disable background auto-sync"),
-        ("/sync interval <N>", "Set auto-sync interval in seconds"),
-        ("/sync status", "Show current sync settings"),
-        ("/import <public_key>", "Import a contact's public key"),
-        ("/alias <id> <name>", "Set or change a contact alias"),
-        ("/theme <name>|list", "Change or list colour themes"),
-        ("/server [url]", "View or set the relay server URL"),
-        ("/config [key] [value]", "View or set configuration"),
-        ("/clear", "Clear the terminal screen"),
-        ("/myid", "Show your device ID and public key"),
-        ("/register", "Register your identity with the relay server"),
-        ("/debug", "Show debug information"),
-        ("/quit or /exit", "Exit NYX"),
-    ]
-    for cmd, desc in help_lines:
-        print(f"  {cmd:<28} {desc}")
-    print()
-    print("=== True Chat CLI Experience ===")
-    print("  1. Select a contact:  /switch Alice")
-    print("  2. Type directly:     Hello Alice, how are you?")
-    print("  3. Commands start with '/': e.g. /help, /contacts, /clear")
-    print()
+    def list_commands(self) -> List[CommandSpec]:
+        return sorted(self._commands.values(), key=lambda c: c.name)
 
-
-def register(
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-    quiet: bool = False,
-) -> Optional[Dict[str, Any]]:
-    """
-    Register this device's public key with the relay server.
-    Generates a new identity if one doesn't exist yet.
-    """
-    if not crypto_engine.has_identity():
-        crypto_engine.generate_identity()
-
-    device_id = crypto_engine.device_id
-    public_key = crypto_engine.get_public_key_b64()
-
-    if not quiet:
-        _info(f"Registering device {device_id}...")
-
-    resp = messaging.post(cfg, "register.php", {
-        "device_id": device_id,
-        "public_key": public_key,
-    })
-
-    if resp is None:
-        if not quiet:
-            _error("Registration failed — server unreachable.")
-        return None
-
-    if resp.get("status") == "ok":
-        if not quiet:
-            _success("Registered successfully.")
-        local_db.save_identity(device_id, public_key)
-    else:
-        if not quiet:
-            _error(f"Registration rejected: {resp.get('error', 'unknown error')}")
-
-    return resp
-
-
-def show_my_id(crypto_engine: crypto.NYXCrypto) -> None:
-    """Display the local device identity."""
-    device_id = crypto_engine.device_id
-    public_key = crypto_engine.get_public_key_b64()
-
-    print()
-    print("Device Identity")
-    print(f"  Device ID:    {device_id}")
-    print(f"  Public Key:   {public_key}")
-    print(f"  Key length:   {len(public_key)} chars (base64, 64 raw bytes)")
-    print()
-    print("Copy the full public key above to share with other NYX users.")
-    print()
-
-
-def list_contacts(
-    local_db: NYXDatabase,
-    sort_by: str = "id",
-) -> None:
-    """Display all known contacts with aliases."""
-    contacts = local_db.get_contacts(sort_by=sort_by)
-    ui.print_contacts_table(contacts, sort_by=sort_by, tm=_tm_or_default())
-
-
-def import_contact(
-    local_db: NYXDatabase,
-    public_key_b64: str,
-    alias: Optional[str] = None,
-    prompt_alias: bool = True,
-) -> Optional[str]:
-    """
-    Import a contact by their public key bundle.
-
-    Accepts the 88-character base64 bundle (the exact output of '/myid').
-    Optionally prompts for an alias if prompt_alias is True and alias is None.
-    Returns the derived device_id on success, or None on failure.
-    """
-    try:
-        ed_pub, x_pub = crypto.parse_public_key_bundle(public_key_b64.strip())
-    except Exception:
-        _error("Invalid public key format.")
-        return None
-
-    device_id = hashlib.sha256(ed_pub).hexdigest()[:16]
-
-    # Optional alias prompt
-    if prompt_alias and alias is None:
+    def dispatch(self, ctx: CommandContext, line: str) -> CommandResult:
+        line = line.strip()
+        if not line:
+            return CommandResult(ok=True, message="")
+        if not line.startswith("/"):
+            return CommandResult(
+                ok=False,
+                message="Commands start with /. Type /help for a list.",
+            )
         try:
-            from prompt_toolkit import prompt as pt_prompt
-            raw = pt_prompt(
-                "Enter alias (optional, press Enter to skip): "
-            ).strip()
-            if raw:
-                alias = raw
-        except (KeyboardInterrupt, EOFError):
-            print()
-        except Exception:
-            pass
-
-    local_db.save_contact(device_id, public_key_b64.strip(), alias=alias)
-
-    if alias:
-        _success(f"Contact imported — device_id: {device_id}, alias: {alias}")
-    else:
-        _success(f"Contact imported — device_id: {device_id}")
-
-    print(f"  Ed25519: {ed_pub.hex()[:32]}...")
-    print(f"  X25519:  {x_pub.hex()[:32]}...")
-    return device_id
-
-
-def set_alias(
-    local_db: NYXDatabase,
-    device_id_or_name: str,
-    alias: str,
-) -> None:
-    """Set or change the alias for a contact."""
-    resolved = local_db.resolve_contact(device_id_or_name)
-    if not resolved:
-        if local_db.get_contact(device_id_or_name):
-            resolved = device_id_or_name
-        else:
-            _error(f"Unknown contact: {device_id_or_name}")
-            return
-
-    ok = local_db.update_alias(resolved, alias)
-    if ok:
-        if alias.strip():
-            _success(f"Alias for {resolved} set to '{alias.strip()}'.")
-        else:
-            _success(f"Alias for {resolved} cleared.")
-    else:
-        _error(f"Failed to update alias for {device_id_or_name}.")
-
-
-def handle_sync_command(
-    cfg: config.NYXConfig,
-    local_db: NYXDatabase,
-    crypto_engine: crypto.NYXCrypto,
-    args: str,
-) -> None:
-    """
-    Handle the multi-form `sync` command:
-
-      /sync              — manual pull
-      /sync on           — enable auto-sync
-      /sync off          — disable auto-sync
-      /sync interval N   — set interval seconds
-      /sync status       — show settings
-    """
-    parts = args.split() if args else []
-
-    if not parts:
-        # Manual sync
-        since = local_db.get_last_sync_time()
-        result = sync_messages(cfg, local_db, crypto_engine, since=since)
-        if result and result.get("messages"):
-            last_times = [
-                m.get("created_at", "")
-                for m in result["messages"]
-                if m.get("created_at")
-            ]
-            if last_times:
-                local_db.set_last_sync_time(max(last_times))
-        return
-
-    sub = parts[0].lower()
-
-    if sub == "on":
-        cfg.set("auto_sync", True)
-        _success("Auto-sync enabled.")
-    elif sub == "off":
-        cfg.set("auto_sync", False)
-        _success("Auto-sync disabled.")
-    elif sub == "interval":
-        if len(parts) < 2:
-            _error("Usage: /sync interval <seconds>")
-            return
+            parts = shlex.split(line[1:])
+        except ValueError as exc:
+            return CommandResult(ok=False, message="parse error: " + str(exc))
+        if not parts:
+            return CommandResult(ok=False, message="empty command")
+        name = parts[0].lower()
+        args = parts[1:]
+        if name in ("help", "?"):
+            return self._help(args)
+        spec = self._commands.get(name)
+        if spec is None:
+            return CommandResult(ok=False, message="unknown command: /" + name)
+        if args and args[0] in ("--help", "-h"):
+            return CommandResult(
+                ok=True,
+                message="/{0} - {1}\nUsage: {2}".format(spec.name, spec.help, spec.usage),
+            )
         try:
-            n = int(parts[1])
-            if n < 1:
-                raise ValueError("must be >= 1")
-            cfg.set("sync_interval", n)
-            _success(f"Sync interval set to {n} second(s).")
-        except ValueError:
-            _error("Interval must be a positive integer.")
-    elif sub == "status":
-        print()
-        print("Sync Settings")
-        print(f"  Auto-sync:     {'ON' if cfg.auto_sync else 'OFF'}")
-        print(f"  Interval:      {cfg.sync_interval}s")
-        last = local_db.get_last_sync_time()
-        print(f"  Last sync:     {last or 'never'}")
-        print()
-    else:
-        _error(f"Unknown sync subcommand: {sub}")
-        _info("Usage: /sync [on|off|interval <N>|status]")
+            return spec.handler(ctx, args)
+        except Exception as e:
+            log.exception("command.error", command=name)
+            return CommandResult(ok=False, message="error: " + str(e))
+
+    def _help(self, args: List[str]) -> CommandResult:
+        if args:
+            key = args[0].lstrip("/").lower()
+            spec = self._commands.get(key)
+            if spec is None:
+                return CommandResult(ok=False, message="unknown: " + args[0])
+            return CommandResult(
+                ok=True,
+                message="/{0} - {1}\nUsage: {2}".format(spec.name, spec.help, spec.usage),
+            )
+        lines = ["Available commands:", ""]
+        for spec in self.list_commands():
+            lines.append("  /{0:<12} {1}".format(spec.name, spec.help))
+        lines.append("")
+        lines.append("Type /help <command> for details.")
+        return CommandResult(ok=True, message="\n".join(lines))
 
 
-def handle_theme_command(cfg: config.NYXConfig, args: str) -> None:
-    """
-    Handle theme commands:
-
-      /theme list
-      /theme <name>
-      /theme            (show current)
-    """
-    parts = args.split() if args else []
-
-    if not parts or parts[0].lower() == "list":
-        print()
-        print("Available themes:")
-        current = cfg.theme
-        for name in sorted(THEMES.keys()):
-            marker = " (active)" if name == current else ""
-            print(f"  • {name}{marker}")
-        print()
-        return
-
-    name = parts[0].lower()
-    if name not in THEMES:
-        _error(f"Unknown theme: {name}")
-        _info(f"Available: {', '.join(sorted(THEMES.keys()))}")
-        return
-
-    cfg.set("theme", name)
-    if messaging._tm is not None:
-        messaging._tm.set_theme(name)
-    _success(f"Theme set to '{name}'.")
+registry = CommandRegistry()
 
 
-def set_config(cfg: config.NYXConfig, key: str, value: str) -> None:
-    """Set a configuration value."""
-    allowed = {
-        "server_url": str,
-        "auto_sync": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
-        "sync_interval": int,
-        "theme": str,
-    }
-    if key not in allowed:
-        _error(f"Unknown config key: {key}")
-        _info(f"Allowed keys: {', '.join(sorted(allowed.keys()))}")
-        return
-
-    if key == "auto_sync":
-        parsed: Any = str(value).lower() in ("1", "true", "yes", "on")
-    elif key == "sync_interval":
-        try:
-            parsed = max(1, int(value))
-        except ValueError:
-            _error("sync_interval must be an integer.")
-            return
-    elif key == "theme":
-        if value.lower() not in THEMES:
-            _error(f"Unknown theme: {value}")
-            return
-        parsed = value.lower()
-        if messaging._tm is not None:
-            messaging._tm.set_theme(parsed)
-    else:
-        parsed = value
-
-    cfg.set(key, parsed)
-    _success(f"{key} = {parsed}")
-
-
-def show_debug_info(
-    crypto_engine: crypto.NYXCrypto,
-    local_db: NYXDatabase,
-    cfg: config.NYXConfig,
-) -> None:
-    """Show debug information about the current state."""
-    print()
-    print("Debug Information")
+@registry.register("status", "Connection, sync, identity status", "/status")
+def cmd_status(ctx: CommandContext, args: List[str]) -> CommandResult:
     lines = [
-        f"  Version:        {config.VERSION}",
-        f"  Config path:    {cfg.config_path}",
-        f"  Server URL:     {cfg.server_url}",
-        f"  DB path:        {cfg.db_path}",
-        f"  Device ID:      {crypto_engine.device_id}",
-        f"  Has identity:   {crypto_engine.has_identity()}",
-        f"  Registered:     {local_db.is_registered()}",
-        f"  Contacts:       {len(local_db.get_contacts())}",
-        f"  Auto-sync:      {cfg.auto_sync}",
-        f"  Sync interval:  {cfg.sync_interval}s",
-        f"  Theme:          {cfg.theme}",
-        f"  Session msgs:   {messaging.session_message_count()}",
+        "Identity : " + (ctx.identity_id or "(none)"),
+        "Server   : " + (ctx.server or "(none)"),
+        "Connected: " + ("yes" if ctx.connected else "no"),
     ]
-    for line in lines:
-        print(line)
-    print()
+    return CommandResult(ok=True, message="\n".join(lines))
+
+
+@registry.register("identity", "Show local identity", "/identity [show]")
+def cmd_identity(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if not ctx.identity_id:
+        return CommandResult(ok=False, message="no identity loaded")
+    return CommandResult(ok=True, message="Identity: " + ctx.identity_id)
+
+
+@registry.register("dm", "Open or send a direct message", "/dm <identity> [message...]")
+def cmd_dm(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if not args:
+        return CommandResult(ok=False, message="Usage: /dm <identity> [message]")
+    peer = args[0]
+    messaging = ctx.services.get("messaging")
+    if messaging is None:
+        return CommandResult(ok=False, message="messaging service not available")
+    if len(args) == 1:
+        hist = messaging.history(peer, limit=20)
+        if not hist:
+            return CommandResult(ok=True, message="(no messages with " + peer[:24] + ")")
+        lines = []
+        for m in hist:
+            arrow = "->" if m.direction.value == "out" else "<-"
+            text = m.plaintext.decode("utf-8", errors="replace")
+            lines.append("  {0} [{1}] {2}".format(arrow, m.sequence, text))
+        return CommandResult(ok=True, message="\n".join(lines))
+    text = " ".join(args[1:])
+    try:
+        env = messaging.send_dm(peer, text.encode("utf-8"))
+        return CommandResult(
+            ok=True,
+            message="sent seq={0} id={1}...".format(env.sequence, env.message_id[:20]),
+            data=env,
+        )
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+
+@registry.register("contacts", "List contacts", "/contacts")
+def cmd_contacts(ctx: CommandContext, args: List[str]) -> CommandResult:
+    store = ctx.services.get("contacts")
+    if store is None:
+        return CommandResult(ok=False, message="contact store not available")
+    contacts = store.list_all()
+    if not contacts:
+        return CommandResult(ok=True, message="(no contacts)")
+    lines = []
+    for c in contacts:
+        name = c.display_name or "(no name)"
+        trust = "trusted" if c.trusted else ""
+        lines.append("  {0}...  {1}  {2}".format(c.identity_id[:28], name, trust))
+    return CommandResult(ok=True, message="\n".join(lines))
+
+
+@registry.register("addcontact", "Add or update a contact", "/addcontact <identity> [name]")
+def cmd_addcontact(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if not args:
+        return CommandResult(ok=False, message="Usage: /addcontact <identity> [name]")
+    store = ctx.services.get("contacts")
+    messaging = ctx.services.get("messaging")
+    if store is None:
+        return CommandResult(ok=False, message="contact store not available")
+    peer = args[0]
+    name = " ".join(args[1:]) if len(args) > 1 else None
+    if messaging is not None:
+        c = messaging.ensure_contact(peer, display_name=name)
+    else:
+        c = store.upsert(peer, display_name=name)
+    return CommandResult(ok=True, message="contact saved: " + c.identity_id[:28] + "...")
+
+
+@registry.register("exit", "Safe exit", "/exit [--force]")
+def cmd_exit(ctx: CommandContext, args: List[str]) -> CommandResult:
+    return CommandResult(ok=True, message="__EXIT__", data={"force": "--force" in args})
+
+
+@registry.register("quit", "Alias for /exit", "/quit")
+def cmd_quit(ctx: CommandContext, args: List[str]) -> CommandResult:
+    return cmd_exit(ctx, args)
+
+
+
+@registry.register("servers", "List known relays ranked by score", "/servers [refresh]")
+def cmd_servers(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or getattr(app, "directory", None) is None:
+        return CommandResult(ok=False, message="server directory not available")
+    if args and args[0] == "refresh":
+        ranked = app.refresh_servers(probe=True)
+    else:
+        ranked = app.directory.ranked()
+    if not ranked:
+        return CommandResult(ok=True, message="(no servers)")
+    lines = ["  SCORE   LAT(ms)  TRUST  ENDPOINT"]
+    for s in ranked[:20]:
+        lines.append(
+            "  {0:5.2f}  {1:7.0f}  {2:5d}  {3}".format(
+                s.score, s.latency_ms, s.trust_level, s.endpoint
+            )
+        )
+    best = app.select_best_server()
+    lines.append("")
+    lines.append("  preferred: " + str(best))
+    return CommandResult(ok=True, message=chr(10).join(lines))
+
+
+@registry.register("update", "Check or install client updates", "/update [check|install]")
+def cmd_update(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or getattr(app, "updater", None) is None:
+        return CommandResult(ok=False, message="update client not available")
+    action = (args[0] if args else "check").lower()
+    if action == "install":
+        try:
+            ver = app.apply_update()
+            return CommandResult(ok=True, message="update result: " + ver)
+        except Exception as exc:
+            return CommandResult(ok=False, message="install failed: " + str(exc))
+    result = app.check_updates()
+    if result.error:
+        return CommandResult(ok=False, message=result.error)
+    if not result.update_available or result.candidate is None:
+        return CommandResult(
+            ok=True,
+            message="up to date (current {0})".format(result.current_version),
+        )
+    c = result.candidate
+    parts = [
+        "update available: {0} (from {1})".format(c.version, result.source),
+        "  current : {0}".format(result.current_version),
+        "  artifact: {0}".format(c.artifact),
+        "  channel : {0}".format(c.release_channel),
+        "Run /update install to download+verify+stage.",
+    ]
+    return CommandResult(ok=True, message=chr(10).join(parts), data=result)
+
+
+@registry.register("connect", "Connect to best or given relay", "/connect [endpoint]")
+def cmd_connect(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    endpoint = args[0] if args else None
+    try:
+        session = app.connect_sync(endpoint=endpoint, use_http=True)
+        ctx.connected = True
+        ctx.server = session.server
+        tok = (session.session_token or "")[:16]
+        return CommandResult(
+            ok=True,
+            message="connected to " + session.server + " token=" + tok,
+        )
+    except Exception as exc:
+        return CommandResult(ok=False, message="connect failed: " + str(exc))
+
+
+@registry.register("newgroup", "Create a private group", "/newgroup <title>")
+def cmd_newgroup(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    if not args:
+        return CommandResult(ok=False, message="Usage: /newgroup <title>")
+    title = " ".join(args)
+    try:
+        room = app.create_group(title)
+        return CommandResult(ok=True, message="group created: " + room.title + " (" + room.room_id[:20] + "...)")
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+
+@registry.register("newchannel", "Create a channel", "/newchannel <title>")
+def cmd_newchannel(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    if not args:
+        return CommandResult(ok=False, message="Usage: /newchannel <title>")
+    title = " ".join(args)
+    try:
+        room = app.create_channel(title, public=True)
+        return CommandResult(ok=True, message="channel created: " + room.title + " (" + room.room_id[:20] + "...)")
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+
+@registry.register("search", "Search users, groups, channels", "/search <query>")
+def cmd_search(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    q = " ".join(args)
+    hits = app.search_directory(q)
+    if not hits:
+        return CommandResult(ok=True, message="(no results)")
+    lines = []
+    for h in hits[:30]:
+        lines.append("  [{0}] {1}  {2}".format(h.kind, h.title, h.subtitle))
+    return CommandResult(ok=True, message=chr(10).join(lines))
+
+
+@registry.register("register", "Show identity / key registration info", "/register")
+def cmd_register(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or app.identity is None:
+        return CommandResult(ok=False, message="no identity")
+    ident = app.identity
+    pub = ident.public_key_bytes.hex()
+    lines = [
+        "Identity (auto-registered):",
+        "  id         : " + ident.id,
+        "  public_key : " + pub[:32] + "..." + pub[-16:],
+        "  private_key: held encrypted in local profile (never displayed)",
+    ]
+    if getattr(app, "last_mnemonic", None):
+        lines.append("  recovery   : (shown once at creation — check startup log)")
+    return CommandResult(ok=True, message=chr(10).join(lines))
+
+
+@registry.register("whois", "Show a user profile", "/whois <identity>")
+def cmd_whois(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    if not args:
+        return CommandResult(ok=False, message="Usage: /whois <identity>")
+    try:
+        prof = app.get_user_profile(args[0])
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+    lines = [
+        "Name    : " + (prof.display_name or "(unknown)"),
+        "Identity: " + prof.identity_id,
+        "Bio     : " + (prof.bio or "(empty)"),
+        "Trusted : " + ("yes" if prof.trusted else "no"),
+    ]
+    return CommandResult(ok=True, message=chr(10).join(lines))
+
+
+@registry.register("setname", "Set local display name for a contact", "/setname <identity> <name>")
+def cmd_setname(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or len(args) < 2:
+        return CommandResult(ok=False, message="Usage: /setname <identity> <name>")
+    peer, name = args[0], " ".join(args[1:])
+    app.set_contact_profile(peer, display_name=name)
+    return CommandResult(ok=True, message="updated name for " + peer[:24])
+
+
+@registry.register("setbio", "Set local bio note for a contact", "/setbio <identity> <bio...>")
+def cmd_setbio(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or len(args) < 2:
+        return CommandResult(ok=False, message="Usage: /setbio <identity> <text>")
+    peer, bio = args[0], " ".join(args[1:])
+    app.set_contact_profile(peer, bio=bio)
+    return CommandResult(ok=True, message="updated bio for " + peer[:24])

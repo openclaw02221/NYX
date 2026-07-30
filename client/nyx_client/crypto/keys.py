@@ -1,218 +1,192 @@
 """
-keys.py — Key generation and public-key bundle helpers for Project NYX.
+Cryptographic key primitives for NYX.
 
-Provides:
-  - X25519 keypair generation (for ECDH key exchange)
-  - Ed25519 keypair generation (for identity / device ID derivation)
-  - Passphrase-based private key encryption (AES-256-GCM + PBKDF2)
-  - Public key bundle encode / decode
+Whitepaper Section 05 (User Model & Identity) and Section 49 (Crypto Inventory):
+
+  Identity Key   : Ed25519, long-term
+  Device Key     : Ed25519, per-device, revocable
+  Session Key    : X25519, per-session (placeholder for later ratchet)
+  Message signing: Ed25519
+
+All private key material is kept in memory only; never logged.
+Uses the audited `cryptography` library (no invented algorithms).
 """
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional
 
-from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
+    Ed25519PublicKey,
 )
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
+    X25519PublicKey,
 )
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import serialization
+from cryptography.exceptions import InvalidSignature
+
+from nyx_client.crypto.bech32 import encode as bech32_encode, decode as bech32_decode
+from nyx_client.config.logging import get_logger
+
+log = get_logger(__name__)
+
+HRP = "nyx"  # Bech32 human-readable part -> nyx1...
 
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class IdentityKeyPair:
+    """Long-term identity key pair (Ed25519)."""
 
-PBKDF2_ITERATIONS = 600_000  # OWASP recommendation for PBKDF2-SHA256
-PBKDF2_SALT_SIZE = 16
-AES_NONCE_SIZE = 12
+    private_key: Ed25519PrivateKey
+    public_key: Ed25519PublicKey
 
+    @classmethod
+    def generate(cls) -> "IdentityKeyPair":
+        priv = Ed25519PrivateKey.generate()
+        return cls(private_key=priv, public_key=priv.public_key())
 
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
+    @classmethod
+    def from_private_bytes(cls, data: bytes) -> "IdentityKeyPair":
+        if len(data) != 32:
+            raise ValueError("Ed25519 private key must be 32 bytes")
+        priv = Ed25519PrivateKey.from_private_bytes(data)
+        return cls(private_key=priv, public_key=priv.public_key())
 
-@dataclass
-class IdentityKeys:
-    """Holds a complete NYX identity: Ed25519 identity + X25519 encryption keys."""
+    def private_bytes(self) -> bytes:
+        return self.private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
 
-    device_id: str
-    # Ed25519 (identity / signing)
-    ed25519_private: bytes  # raw 32-byte seed
-    ed25519_public: bytes   # raw 32-byte public key
-    # X25519 (encryption / ECDH)
-    x25519_private: bytes   # raw 32-byte private key
-    x25519_public: bytes    # raw 32-byte public key
+    def public_bytes(self) -> bytes:
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
 
+    def sign(self, message: bytes) -> bytes:
+        return self.private_key.sign(message)
 
-@dataclass
-class EncryptedMessage:
-    """Result of encrypting a plaintext message for a recipient."""
+    def verify(self, signature: bytes, message: bytes) -> bool:
+        try:
+            self.public_key.verify(signature, message)
+            return True
+        except InvalidSignature:
+            return False
 
-    ciphertext_b64: str   # base64(ephemeral_pub || ciphertext_with_tag)
-    nonce_b64: str        # base64(nonce)
-    message_id: str       # unique message identifier
+    def identity_string(self) -> str:
+        """Bech32-encoded identity: nyx1..."""
+        return bech32_encode(HRP, 0, self.public_bytes())
 
+    @staticmethod
+    def public_key_from_identity(identity: str) -> Ed25519PublicKey:
+        hrp, witver, prog = bech32_decode(identity)
+        if hrp != HRP:
+            raise ValueError(f"unexpected HRP: {hrp}")
+        if witver != 0:
+            raise ValueError(f"unexpected witness version: {witver}")
+        if len(prog) != 32:
+            raise ValueError("identity public key must be 32 bytes")
+        return Ed25519PublicKey.from_public_bytes(prog)
 
-# ---------------------------------------------------------------------------
-# Key generation
-# ---------------------------------------------------------------------------
-
-def generate_identity() -> IdentityKeys:
-    """
-    Generate a fresh NYX identity.
-
-    Creates an Ed25519 keypair (for identity) and an X25519 keypair
-    (for encryption). The device_id is derived from the Ed25519 public key
-    as a truncated SHA-256 hex digest.
-    """
-    # Ed25519 identity key
-    ed_priv = Ed25519PrivateKey.generate()
-    ed_pub = ed_priv.public_key()
-    ed_priv_bytes = ed_priv.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    ed_pub_bytes = ed_pub.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-
-    # X25519 encryption key
-    x_priv = X25519PrivateKey.generate()
-    x_pub = x_priv.public_key()
-    x_priv_bytes = x_priv.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    x_pub_bytes = x_pub.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-
-    # Device ID: first 16 hex chars of SHA-256(ed25519_public)
-    device_id = hashlib.sha256(ed_pub_bytes).hexdigest()[:16]
-
-    return IdentityKeys(
-        device_id=device_id,
-        ed25519_private=ed_priv_bytes,
-        ed25519_public=ed_pub_bytes,
-        x25519_private=x_priv_bytes,
-        x25519_public=x_pub_bytes,
-    )
+    @staticmethod
+    def verify_with_identity(
+        identity: str, signature: bytes, message: bytes
+    ) -> bool:
+        try:
+            pub = IdentityKeyPair.public_key_from_identity(identity)
+            pub.verify(signature, message)
+            return True
+        except (ValueError, InvalidSignature):
+            return False
 
 
-def public_key_bundle_b64(identity: IdentityKeys) -> str:
-    """
-    Encode the public key bundle as a base64 string for registration.
+@dataclass(frozen=True, slots=True)
+class DeviceKeyPair:
+    """Per-device Ed25519 key pair, signed by the identity key."""
 
-    Format: base64( ed25519_public (32) || x25519_public (32) )
-    Total: 64 raw bytes → 88 base64 characters.
-    """
-    bundle = identity.ed25519_public + identity.x25519_public
-    return base64.b64encode(bundle).decode("ascii")
+    private_key: Ed25519PrivateKey
+    public_key: Ed25519PublicKey
+    device_id: str  # short fingerprint for display
 
+    @classmethod
+    def generate(cls) -> "DeviceKeyPair":
+        priv = Ed25519PrivateKey.generate()
+        pub = priv.public_key()
+        pub_bytes = pub.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        # First 8 bytes of public key as hex device_id (whitepaper style)
+        device_id = "dev_" + pub_bytes[:8].hex()
+        return cls(private_key=priv, public_key=pub, device_id=device_id)
 
-def parse_public_key_bundle(bundle_b64: str) -> Tuple[bytes, bytes]:
-    """
-    Decode a public key bundle.
+    def private_bytes(self) -> bytes:
+        return self.private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
 
-    Returns (ed25519_public, x25519_public) as raw bytes.
-    """
-    raw = base64.b64decode(bundle_b64)
-    if len(raw) != 64:
-        raise ValueError(f"Invalid public key bundle length: expected 64 bytes, got {len(raw)}")
-    return raw[:32], raw[32:]
+    def public_bytes(self) -> bytes:
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
 
+    def sign(self, message: bytes) -> bytes:
+        return self.private_key.sign(message)
 
-# ---------------------------------------------------------------------------
-# Passphrase-based private key encryption (for local storage)
-# ---------------------------------------------------------------------------
-
-def encrypt_private_keys(
-    identity: IdentityKeys,
-    passphrase: str,
-) -> Tuple[str, str, str]:
-    """
-    Encrypt the private keys with a user passphrase for local storage.
-
-    Uses PBKDF2-HMAC-SHA256 to derive an AES-256 key, then AES-256-GCM
-    to encrypt the concatenated private keys.
-
-    Returns (encrypted_blob_b64, salt_b64, nonce_b64).
-    """
-    salt = os.urandom(PBKDF2_SALT_SIZE)
-    nonce = os.urandom(AES_NONCE_SIZE)
-
-    # Derive AES-256 key from passphrase
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=PBKDF2_ITERATIONS,
-    )
-    aes_key = kdf.derive(passphrase.encode("utf-8"))
-
-    # Concatenate private keys: ed25519_priv (32) || x25519_priv (32)
-    plaintext = identity.ed25519_private + identity.x25519_private
-
-    aesgcm = AESGCM(aes_key)
-    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
-
-    return (
-        base64.b64encode(ciphertext).decode("ascii"),
-        base64.b64encode(salt).decode("ascii"),
-        base64.b64encode(nonce).decode("ascii"),
-    )
+    def verify(self, signature: bytes, message: bytes) -> bool:
+        try:
+            self.public_key.verify(signature, message)
+            return True
+        except InvalidSignature:
+            return False
 
 
-def decrypt_private_keys(
-    encrypted_blob_b64: str,
-    salt_b64: str,
-    nonce_b64: str,
-    passphrase: str,
-    device_id: str,
-    ed25519_public: bytes,
-    x25519_public: bytes,
-) -> IdentityKeys:
-    """
-    Decrypt private keys from local storage using the user passphrase.
+@dataclass(frozen=True, slots=True)
+class X25519KeyPair:
+    """X25519 key pair for key agreement (sessions / prekeys)."""
 
-    Returns a fully reconstructed IdentityKeys object.
-    Raises cryptography.exceptions.InvalidTag on wrong passphrase.
-    """
-    salt = base64.b64decode(salt_b64)
-    nonce = base64.b64decode(nonce_b64)
-    ciphertext = base64.b64decode(encrypted_blob_b64)
+    private_key: X25519PrivateKey
+    public_key: X25519PublicKey
 
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=PBKDF2_ITERATIONS,
-    )
-    aes_key = kdf.derive(passphrase.encode("utf-8"))
+    @classmethod
+    def generate(cls) -> "X25519KeyPair":
+        priv = X25519PrivateKey.generate()
+        return cls(private_key=priv, public_key=priv.public_key())
 
-    aesgcm = AESGCM(aes_key)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    @classmethod
+    def from_private_bytes(cls, data: bytes) -> "X25519KeyPair":
+        if len(data) != 32:
+            raise ValueError("X25519 private key must be 32 bytes")
+        priv = X25519PrivateKey.from_private_bytes(data)
+        return cls(private_key=priv, public_key=priv.public_key())
 
-    if len(plaintext) != 64:
-        raise ValueError("Decrypted private key blob has unexpected length")
+    def private_bytes(self) -> bytes:
+        return self.private_key.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
 
-    return IdentityKeys(
-        device_id=device_id,
-        ed25519_private=plaintext[:32],
-        ed25519_public=ed25519_public,
-        x25519_private=plaintext[32:],
-        x25519_public=x25519_public,
-    )
+    def public_bytes(self) -> bytes:
+        return self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+
+    def exchange(self, peer_public_bytes: bytes) -> bytes:
+        peer = X25519PublicKey.from_public_bytes(peer_public_bytes)
+        return self.private_key.exchange(peer)
+
+
+def generate_random_bytes(n: int = 32) -> bytes:
+    """Cryptographically secure random bytes."""
+    return os.urandom(n)

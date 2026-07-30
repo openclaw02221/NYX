@@ -1,143 +1,159 @@
 """
-identity.py — High-level identity management for the NYX client.
+NYX cryptographic identity.
 
-Manages identity generation, persistence (to files), and
-encrypt/decrypt operations for the REPL layer.
+Whitepaper Section 05 — User Model & Identity:
+
+  Account (nyx1...)
+  ├── Identity Key Pair (Ed25519, long-term)
+  │   ├── Device 1 ── Session Keys (X25519, rotating)
+  │   └── ...
+  ├── Prekey Bundle (signed, for X3DH)
+  ├── Optional: Recovery Key (user-held)
+  └── Optional: Email (recovery only, not identity)
+
+This module owns creation, loading, and basic operations on an Identity.
+Private keys never leave this module except as explicit export for
+encrypted storage (handled by the storage layer).
 """
 
 from __future__ import annotations
 
-import base64
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-from nyx_client.crypto.aead import decrypt_message, encrypt_message
 from nyx_client.crypto.keys import (
-    IdentityKeys,
-    generate_identity,
-    public_key_bundle_b64,
+    DeviceKeyPair,
+    IdentityKeyPair,
+    X25519KeyPair,
+    generate_random_bytes,
 )
+from nyx_client.config.logging import get_logger
+
+log = get_logger(__name__)
 
 
-class NYXCrypto:
+@dataclass
+class Identity:
     """
-    High-level cryptographic interface for the NYX client.
+    In-memory representation of a NYX identity.
 
-    Manages identity generation, persistence (to files), and
-    encrypt/decrypt operations for the REPL layer.
+    The object is mutable only for adding/revoking devices.
+    The identity key pair itself is immutable after creation.
     """
 
-    def __init__(self, device_id_path: str, keys_path: str):
-        self._device_id_path = device_id_path
-        self._keys_path = keys_path
-        self._identity: Optional[IdentityKeys] = None
-        self._load()
-
-    # -- persistence ----------------------------------------------------------
-
-    def _load(self) -> None:
-        """Try to load an existing identity from disk."""
-        try:
-            with open(self._device_id_path, "r") as f:
-                device_id = f.read().strip()
-        except FileNotFoundError:
-            return
-
-        try:
-            import json
-            with open(self._keys_path, "r") as f:
-                keys = json.load(f)
-        except (FileNotFoundError, Exception):
-            return
-
-        try:
-            self._identity = IdentityKeys(
-                device_id=device_id,
-                ed25519_private=base64.b64decode(keys["ed25519_private"]),
-                ed25519_public=base64.b64decode(keys["ed25519_public"]),
-                x25519_private=base64.b64decode(keys["x25519_private"]),
-                x25519_public=base64.b64decode(keys["x25519_public"]),
-            )
-        except Exception:
-            pass
-
-    def _save(self) -> None:
-        """Persist the identity to disk."""
-        if self._identity is None:
-            return
-
-        import json
-        from pathlib import Path
-
-        Path(self._device_id_path).parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self._device_id_path, "w") as f:
-            f.write(self._identity.device_id)
-
-        with open(self._keys_path, "w") as f:
-            json.dump({
-                "ed25519_private": base64.b64encode(self._identity.ed25519_private).decode(),
-                "ed25519_public":  base64.b64encode(self._identity.ed25519_public).decode(),
-                "x25519_private":  base64.b64encode(self._identity.x25519_private).decode(),
-                "x25519_public":   base64.b64encode(self._identity.x25519_public).decode(),
-            }, f, indent=2)
-
-    # -- public API -----------------------------------------------------------
-
-    def has_identity(self) -> bool:
-        """Return True if an identity is loaded."""
-        return self._identity is not None
+    identity_key: IdentityKeyPair
+    devices: List[DeviceKeyPair] = field(default_factory=list)
+    # Future: prekeys, recovery material, email_hash
 
     @property
-    def device_id(self) -> str:
-        """Return the device_id, or empty string if no identity."""
-        return self._identity.device_id if self._identity else ""
+    def id(self) -> str:
+        """Bech32 identity string (nyx1...)."""
+        return self.identity_key.identity_string()
 
-    def generate_identity(self) -> IdentityKeys:
-        """Generate a new identity and save it to disk."""
-        self._identity = generate_identity()
-        self._save()
-        return self._identity
+    @property
+    def public_key_bytes(self) -> bytes:
+        return self.identity_key.public_bytes()
 
-    def get_public_key_b64(self) -> str:
-        """Return the base64 public key bundle."""
-        if self._identity is None:
-            return ""
-        return public_key_bundle_b64(self._identity)
-
-    def encrypt(self, plaintext: str, recipient_x25519_public: bytes) -> Tuple[str, str]:
+    @classmethod
+    def create(cls, with_device: bool = True) -> "Identity":
         """
-        Encrypt a message for a recipient.
+        Create a brand-new identity with a fresh Ed25519 key pair.
 
-        MUST accept recipient's X25519 public key (raw 32 bytes) as parameter.
-        MUST call encrypt_message(plaintext, recipient_x25519_public, self._identity.device_id).
-
-        Returns (ciphertext_b64, nonce_b64).
+        Parameters
+        ----------
+        with_device:
+            If True, also generate and attach the first device key.
         """
-        if self._identity is None:
-            raise RuntimeError("No identity loaded")
+        ik = IdentityKeyPair.generate()
+        devices: List[DeviceKeyPair] = []
+        if with_device:
+            devices.append(DeviceKeyPair.generate())
+        identity = cls(identity_key=ik, devices=devices)
+        log.info(
+            "identity.created",
+            identity=identity.id,
+            devices=len(devices),
+        )
+        return identity
 
-        enc = encrypt_message(plaintext, recipient_x25519_public, self._identity.device_id)
-        return enc.ciphertext_b64, enc.nonce_b64
+    def add_device(self) -> DeviceKeyPair:
+        """Generate and attach a new device key pair."""
+        dev = DeviceKeyPair.generate()
+        self.devices.append(dev)
+        log.info("identity.device_added", identity=self.id, device_id=dev.device_id)
+        return dev
 
-    def decrypt(self, ciphertext_b64: str, nonce_b64: str, sender_device_id: str) -> Optional[str]:
-        """
-        Decrypt a message.
+    def primary_device(self) -> Optional[DeviceKeyPair]:
+        """Return the first non-revoked device, or None."""
+        return self.devices[0] if self.devices else None
 
-        MUST accept sender_device_id as parameter for AAD verification.
-        MUST call decrypt_message(ciphertext_b64, nonce_b64, self._identity.x25519_private, sender_device_id).
+    def sign(self, message: bytes) -> bytes:
+        """Sign with the long-term identity key."""
+        return self.identity_key.sign(message)
 
-        Returns the plaintext string, or None on failure.
-        """
-        if self._identity is None:
-            return None
+    def verify(self, signature: bytes, message: bytes) -> bool:
+        return self.identity_key.verify(signature, message)
 
-        try:
-            plaintext = decrypt_message(
-                ciphertext_b64,
-                nonce_b64,
-                self._identity.x25519_private,
-                sender_device_id,
-            )
-            return plaintext
-        except Exception:
-            return None
+    def export_public(self) -> dict:
+        """Public-only view safe to share / store in clear."""
+        return {
+            "identity": self.id,
+            "public_key": self.public_key_bytes.hex(),
+            "devices": [
+                {"device_id": d.device_id, "public_key": d.public_bytes().hex()}
+                for d in self.devices
+            ],
+        }
+
+    def __repr__(self) -> str:
+        return f"Identity({self.id[:20]}..., devices={len(self.devices)})"
+
+
+# ---------------------------------------------------------------------------
+# Recovery helpers (BIP39)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class RecoveryBundle:
+    """
+    Result of generating a recoverable identity.
+
+    The mnemonic must be shown to the user exactly once and never stored
+    by the client in cleartext. The seed is used to derive a recovery
+    key that can re-create or unlock the identity later.
+    """
+
+    identity: Identity
+    mnemonic: tuple  # tuple[str, ...]  (immutable)
+    seed: bytes      # 64-byte BIP39 seed (keep in memory only)
+
+    def mnemonic_phrase(self) -> str:
+        return " ".join(self.mnemonic)
+
+
+def create_recoverable_identity(
+    passphrase: str = "",
+    with_device: bool = True,
+) -> RecoveryBundle:
+    """
+    Create a new identity together with a 24-word BIP39 recovery mnemonic.
+
+    The mnemonic is the only way to recover the identity if all devices
+    are lost (whitepaper Section 05). The caller MUST display it to the
+    user and then discard it from memory after confirmation.
+    """
+    from nyx_client.crypto.bip39 import generate_mnemonic, mnemonic_to_seed
+
+    words = generate_mnemonic(256)
+    seed = mnemonic_to_seed(words, passphrase=passphrase)
+    identity = Identity.create(with_device=with_device)
+    log.info(
+        "identity.recoverable_created",
+        identity=identity.id,
+        mnemonic_words=len(words),
+    )
+    return RecoveryBundle(
+        identity=identity,
+        mnemonic=tuple(words),
+        seed=seed,
+    )

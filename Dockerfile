@@ -14,7 +14,6 @@ COPY server/ /app/
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:${PORT:-8000}/ || exit 1
+  CMD curl -f http://localhost:8000/ || exit 1
 
-# Shell form (نه exec form) تا $PORT expand شود
-CMD php -S 0.0.0.0:${PORT:-8000} /app/index.php
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8000} /app/index.php"]

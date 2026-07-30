@@ -1,22 +1,23 @@
 """
-ui.py — Minimal shim for backward compatibility.
+ui.py — Compatibility shim.
 
-All display logic now lives in main.py (REPL loop) and commands.py.
-This module exists only so `import ui` doesn't break if referenced anywhere.
+This file re-exports everything from nyx_client.ui.display for backward compatibility.
+New code should import directly from nyx_client.ui or nyx_client.ui.display.
 """
-
-from __future__ import annotations
-
-from rich.console import Console
-
-console = Console()
-
-
-def show_welcome() -> None:
-    """No-op — the REPL banner is printed by main.py."""
-    pass
-
-
-def show_menu() -> None:
-    """No-op — commands are typed in the REPL now."""
-    pass
+from nyx_client.ui.display import (  # noqa: F401
+    ANSI,
+    ColorSystem,
+    Console,
+    Spinner,
+    ThemeManager,
+    display_chat_message,
+    display_contacts,
+    hide_spinner,
+    input_yes_no,
+    no_color_mode,
+    print_banner,
+    print_status,
+    show_spinner,
+    show_sync_spinner,
+    test_connection_with_spinner,
+)

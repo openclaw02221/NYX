@@ -40,7 +40,7 @@ if ($uri === '/' || $uri === '/index.php') {
 
     json_response(200, [
         'service'  => 'NYX Relay Server',
-        'version'  => '1.0.0-mvp',
+        'version'  => '0.0.3',
         'status'   => 'online',
         'stats'    => [
             'registered_devices' => $deviceCount,

@@ -1,4 +1,4 @@
-# Project NYX — Terminal-Native Encrypted Communication Protocol
+# Project NYX v0.0.3 — Terminal-Native Encrypted Communication Protocol
 
 A privacy-oriented, end-to-end encrypted messaging system with a Python terminal client (interactive REPL) and a PHP relay server. All encryption/decryption happens client-side; the server acts only as a blind relay for ciphertext.
 

@@ -13,13 +13,27 @@ from nyx_client.storage.contacts import ContactStore, Contact
 from nyx_client.storage.user_prefs import UserPrefs, UserProfile
 from nyx_client.storage.rooms import RoomStore, Room
 
+# Backward compatibility alias
+ContactStorage = ContactStore
+
+# NYXDatabase facade for compatibility
+class NYXDatabase:
+    def __init__(self, db_path: str = ":memory:"):
+        self.db = Database(db_path)
+        self.contacts = ContactStore(self.db)
+        self.messages = MessageStore(self.db)
+        self.rooms = RoomStore(self.db)
+        self.profile = ProfileStore(self.db)
+
 __all__ = [
     "Database",
+    "NYXDatabase",
     "ProfileStore",
     "derive_profile_key_from_passphrase",
     "MessageStore",
     "StoredMessage",
     "ContactStore",
+    "ContactStorage",
     "Contact",
     "UserPrefs",
     "UserProfile",

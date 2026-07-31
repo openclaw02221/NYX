@@ -27,6 +27,15 @@ class ContactStore:
     def __init__(self, db: Database) -> None:
         self._db = db
 
+    def get_contacts_sorted(self) -> List[Contact]:
+        """Get all contacts sorted by display_name."""
+        return self.list_all()
+
+    def get_unread_count(self, identity_id: str) -> int:
+        """Get unread message count for a contact."""
+        # Placeholder implementation
+        return 0
+
     def upsert(
         self,
         identity_id: str,

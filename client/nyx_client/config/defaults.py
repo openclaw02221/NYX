@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
+VERSION = "0.0.5"
+
 # ---------------------------------------------------------------------------
 # Canonical default tree (mirrors the TOML structure users will write)
 # ---------------------------------------------------------------------------

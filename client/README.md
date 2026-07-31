@@ -1,4 +1,4 @@
-# NYX Client 0.2.0
+# NYX Client 0.0.5
 
 **Terminal-native secure messaging client** implementing the NYX Whitepaper v3.0 MVP + auto-update + multi-relay selection.
 

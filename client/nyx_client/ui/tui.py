@@ -12,7 +12,7 @@ from textual import on, work
 from textual.events import Mount
 
 from nyx_client.config.defaults import VERSION
-from nyx_client.protocol.types import MessageType
+from nyx_client.protocol.types import ConversationType, MessageDirection, MessageStatus
 
 class HeaderBar(Static):
     """Custom header for NYX."""

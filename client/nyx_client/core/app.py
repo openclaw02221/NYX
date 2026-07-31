@@ -275,7 +275,7 @@ class NyxApp:
         try:
             req = urllib.request.Request(
                 url,
-                headers={"Accept": "application/json", "User-Agent": "nyx-client/0.2.0"},
+                headers={"Accept": "application/json", "User-Agent": "nyx-client/0.0.5"},
             )
             with urllib.request.urlopen(
                 req, timeout=float(self.settings.network.connection_timeout)

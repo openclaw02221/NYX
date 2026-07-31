@@ -3,11 +3,11 @@ from typing import List, Optional, Dict, Any
 import asyncio
 
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button
 from textual.binding import Binding
 from textual.reactive import reactive
-from textual.screen import Screen
+from textual.screen import Screen, ModalScreen
 from textual import on, work
 from textual.events import Mount
 
@@ -52,6 +52,121 @@ class ChatMessage(Static):
         time_str = self.timestamp.strftime("%H:%M")
         sender_name = "You" if self.is_self else self.sender
         return f"[{time_str}] {sender_name}: {self.content}"
+
+class HelpScreen(ModalScreen[None]):
+    """Help overlay showing all key bindings."""
+    
+    BINDINGS = [("escape", "dismiss", "Close")]
+    
+    def compose(self) -> ComposeResult:
+        help_text = """
+╔═══════════════════════════════════════════════════════════╗
+║           NYX v0.0.5 - KEY BINDINGS REFERENCE            ║
+╠═══════════════════════════════════════════════════════════╣
+║ GLOBAL BINDINGS:                                         ║
+║   Ctrl+Q     - Quit application                          ║
+║   Ctrl+H     - Show this help                            ║
+║   Ctrl+T     - Cycle theme                               ║
+║   Ctrl+R     - Force sync messages                       ║
+║   Ctrl+N     - Add new contact                           ║
+║   Ctrl+S     - Server settings                           ║
+║                                                           ║
+║ NAVIGATION:                                              ║
+║   Tab        - Focus next widget                         ║
+║   Shift+Tab  - Focus previous widget                     ║
+║   Up/Down    - Navigate lists                            ║
+║   Enter      - Select/Activate                           ║
+║   Escape     - Go back/Cancel                            ║
+╚═══════════════════════════════════════════════════════════╝
+        """
+        with Container(id="help_modal"):
+            yield Static(help_text, id="help_content")
+            yield Button("Close [Esc]", id="help_close_btn")
+    
+    @on(Button.Pressed, "#help_close_btn")
+    def close_help(self):
+        self.dismiss()
+
+class ServerSettingsScreen(ModalScreen[Optional[str]]):
+    """Server settings dialog."""
+    
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+    
+    def __init__(self, current_url: str):
+        super().__init__()
+        self.current_url = current_url
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="server_modal"):
+            yield Static("╔═══════════ SERVER SETTINGS ════════════╗", id="server_title")
+            yield Label(f"Current: {self.current_url}")
+            yield Input(placeholder="Enter new server URL", id="server_url_input")
+            yield Static("", id="test_result")
+            with Horizontal(id="server_buttons"):
+                yield Button("Test Connection", id="test_btn", variant="primary")
+                yield Button("Save & Reconnect", id="save_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+    
+    @on(Button.Pressed, "#test_btn")
+    async def test_connection(self):
+        input_widget = self.query_one("#server_url_input", Input)
+        url = input_widget.value.strip()
+        if not url:
+            self.query_one("#test_result", Static).update("⚠ Please enter a URL")
+            return
+        
+        result_widget = self.query_one("#test_result", Static)
+        result_widget.update("⏳ Testing connection...")
+        
+        try:
+            import requests
+            response = requests.get(f"{url}/api/v3/health", timeout=5)
+            if response.status_code == 200:
+                result_widget.update("✓ Connected successfully")
+            else:
+                result_widget.update(f"✗ Failed: HTTP {response.status_code}")
+        except Exception as e:
+            result_widget.update(f"✗ Failed: {str(e)[:50]}")
+    
+    @on(Button.Pressed, "#save_btn")
+    def save_settings(self):
+        input_widget = self.query_one("#server_url_input", Input)
+        url = input_widget.value.strip()
+        if url:
+            self.dismiss(url)
+        else:
+            self.query_one("#test_result", Static).update("⚠ Please enter a URL")
+    
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+class AddContactScreen(ModalScreen[Optional[Dict[str, str]]]):
+    """Add contact dialog."""
+    
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="add_contact_modal"):
+            yield Static("╔═══════════ ADD NEW CONTACT ════════════╗", id="add_contact_title")
+            yield Input(placeholder="Paste nyx1... address", id="contact_address_input")
+            yield Input(placeholder="Alias (optional)", id="contact_alias_input")
+            with Horizontal(id="add_contact_buttons"):
+                yield Button("Add Contact", id="add_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+    
+    @on(Button.Pressed, "#add_btn")
+    def add_contact(self):
+        address = self.query_one("#contact_address_input", Input).value.strip()
+        alias = self.query_one("#contact_alias_input", Input).value.strip()
+        if address:
+            self.dismiss({"address": address, "alias": alias})
+        else:
+            self.notify("Please enter a nyx address", severity="warning")
+    
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
 
 class NYXApp(App):
     """Main Textual application for NYX."""
@@ -103,10 +218,36 @@ class NYXApp(App):
     ChatMessage {
         margin: 0 0 1 0;
     }
+    
+    #help_modal, #server_modal, #add_contact_modal {
+        width: 70;
+        height: auto;
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+    }
+    
+    #help_content {
+        margin: 1 0;
+        color: $text;
+    }
+    
+    #server_buttons, #add_contact_buttons {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        align: center middle;
+    }
+    
+    Button {
+        margin: 0 1;
+    }
     """
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", show=True),
+        Binding("ctrl+h", "show_help", "Help", show=True),
+        Binding("ctrl+t", "cycle_theme", "Theme", show=True),
         Binding("ctrl+n", "new_contact", "New", show=True),
         Binding("ctrl+s", "server_settings", "Server", show=True),
         Binding("ctrl+r", "sync", "Sync", show=True),
@@ -119,6 +260,8 @@ class NYXApp(App):
         super().__init__()
         self.nyx_app = nyx_app
         self.header_bar = HeaderBar()
+        self.theme_cycle = ["midnight", "ember", "forest", "violet", "mono", "ocean"]
+        self.current_theme_index = 0
 
     def compose(self) -> ComposeResult:
         """Create child widgets for the app."""
@@ -228,14 +371,46 @@ class NYXApp(App):
             self.refresh_chat()
             self.notify("Synced with server")
 
-    def action_new_contact(self) -> None:
-        """Open a dialog to add a new contact."""
-        # For now, just a notification as I haven't implemented the dialog yet
-        self.notify("Ctrl+N: Add contact not implemented yet in this view")
+    def action_show_help(self) -> None:
+        """Show help overlay with key bindings."""
+        self.push_screen(HelpScreen())
+    
+    def action_cycle_theme(self) -> None:
+        """Cycle through available themes."""
+        self.current_theme_index = (self.current_theme_index + 1) % len(self.theme_cycle)
+        theme_name = self.theme_cycle[self.current_theme_index]
+        self.header_bar.theme_name = theme_name
+        self.notify(f"Theme: {theme_name}")
+    
+    async def action_new_contact(self) -> None:
+        """Open dialog to add a new contact."""
+        result = await self.push_screen_wait(AddContactScreen())
+        if result and self.nyx_app:
+            try:
+                # Add contact to database
+                self.nyx_app.storage.contacts.add_contact(
+                    device_id=result["address"],
+                    alias=result["alias"] or None
+                )
+                self.refresh_contacts()
+                self.notify(f"✓ Added contact: {result['alias'] or result['address'][:12]}")
+            except Exception as e:
+                self.notify(f"Failed to add contact: {e}", severity="error")
 
-    def action_server_settings(self) -> None:
-        """Open server settings."""
-        self.notify("Ctrl+S: Server settings not implemented yet in this view")
+    async def action_server_settings(self) -> None:
+        """Open server settings dialog."""
+        if not self.nyx_app:
+            return
+        
+        current_url = getattr(self.nyx_app.config.network, 'default_server', 'Unknown')
+        result = await self.push_screen_wait(ServerSettingsScreen(current_url))
+        
+        if result:
+            # Update config and reconnect
+            self.nyx_app.config.network.default_server = result
+            # TODO: Save to config.toml and reconnect
+            self.header_bar.status = f"Server: {result}"
+            self.notify(f"✓ Server updated: {result}")
 
 if __name__ == "__main__":
     app = NYXApp()

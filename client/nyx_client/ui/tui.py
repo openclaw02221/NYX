@@ -25,18 +25,24 @@ class HeaderBar(Static):
         return f" NYX v{VERSION} │ {self.status} │ {self.identity} │ Theme: {self.theme_name} "
 
 class ContactItem(ListItem):
-    """An item in the contact list."""
+    """An item in the contact list (contact or group)."""
     
-    def __init__(self, contact: Dict[str, Any], unread_count: int = 0):
+    def __init__(self, contact: Dict[str, Any], unread_count: int = 0, is_group: bool = False):
         super().__init__()
         self.contact = contact
-        self.device_id = contact['device_id']
-        self.alias = contact.get('alias') or self.device_id[:12]
+        self.is_group = is_group
+        if is_group:
+            self.device_id = contact.get('room_id', '')
+            self.alias = contact.get('title', 'Unnamed Group')
+        else:
+            self.device_id = contact['device_id']
+            self.alias = contact.get('alias') or self.device_id[:12]
         self.unread_count = unread_count
 
     def compose(self) -> ComposeResult:
         unread_badge = f" [{self.unread_count}]" if self.unread_count > 0 else ""
-        yield Label(f"● {self.alias}{unread_badge}")
+        prefix = "◆" if self.is_group else "●"
+        yield Label(f"{prefix} {self.alias}{unread_badge}")
 
 class ChatMessage(Static):
     """A message in the chat window."""
@@ -252,6 +258,13 @@ class NYXApp(App):
         layout: vertical;
     }
 
+    #chat_header {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
+        border-bottom: solid $primary;
+    }
+
     #chat_messages {
         height: 1fr;
         overflow-y: scroll;
@@ -334,6 +347,7 @@ class NYXApp(App):
                 yield Label(" CONTACTS ", id="sidebar_title")
                 yield ListView(id="contact_list")
             with Vertical(id="chat_area"):
+                yield Static("", id="chat_header")
                 yield Vertical(id="chat_messages")
                 yield Input(placeholder="Type a message...", id="input_bar")
         yield Footer()
@@ -347,7 +361,7 @@ class NYXApp(App):
             self.run_background_sync()
 
     def refresh_contacts(self) -> None:
-        """Refresh the contact list from the application state."""
+        """Refresh the contact list from the application state (contacts + groups)."""
         if not self.nyx_app:
             return
         
@@ -355,9 +369,24 @@ class NYXApp(App):
         contact_list = self.query_one("#contact_list", ListView)
         contact_list.clear()
         
+        # Add contacts
         for contact in self.nyx_app.contacts:
             unread = self.nyx_app.storage.contacts.get_unread_count(contact['device_id'])
-            contact_list.append(ContactItem(contact, unread))
+            contact_list.append(ContactItem(contact, unread, is_group=False))
+        
+        # Add groups/rooms
+        try:
+            rooms = self.nyx_app.storage.rooms.list_all()
+            for room in rooms:
+                room_dict = {
+                    'room_id': room.room_id,
+                    'title': room.title,
+                    'room_type': room.room_type,
+                    'owner_id': room.owner_id
+                }
+                contact_list.append(ContactItem(room_dict, 0, is_group=True))
+        except Exception:
+            pass  # Groups not yet supported or database issue
 
     @work(exclusive=True)
     async def run_background_sync(self) -> None:
@@ -386,9 +415,24 @@ class NYXApp(App):
             self.refresh_chat()
 
     def refresh_chat(self) -> None:
-        """Refresh the chat window with messages from the active contact."""
+        """Refresh the chat window with messages from the active contact or group."""
         if not self.active_contact or not self.nyx_app:
             return
+        
+        # Determine if this is a group or DM
+        is_group = 'room_id' in self.active_contact
+        
+        # Update chat header
+        chat_header = self.query_one("#chat_header", Static)
+        if is_group:
+            room_id = self.active_contact['room_id']
+            title = self.active_contact.get('title', 'Unnamed Group')
+            room_type = self.active_contact.get('room_type', 'private_group')
+            chat_header.update(f"Group: {title} ({room_type})")
+        else:
+            alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
+            addr = self.active_contact.get('device_id', '')[:20]
+            chat_header.update(f"Chat: {alias} ({addr}...)")
         
         chat_messages = self.query_one("#chat_messages", Vertical)
         # Clear existing messages
@@ -396,14 +440,19 @@ class NYXApp(App):
             child.remove()
         
         # Load messages from storage
-        device_id = self.active_contact['device_id']
-        messages = self.nyx_app.storage.messages.get_messages(device_id)
-        
-        for msg in messages:
-            is_self = msg['sender_id'] == self.nyx_app.identity.device_id
-            sender_name = self.active_contact['alias'] if not is_self else "You"
-            ts = datetime.fromisoformat(msg['timestamp']) if isinstance(msg['timestamp'], str) else msg['timestamp']
-            chat_messages.mount(ChatMessage(sender_name, msg['content'], ts, is_self))
+        if is_group:
+            # Group messages: load from conversation with room_id
+            # For MVP, groups may not have message history yet
+            chat_messages.mount(Static("Group chat (messaging coming soon)"))
+        else:
+            device_id = self.active_contact['device_id']
+            messages = self.nyx_app.storage.messages.get_messages(device_id)
+            
+            for msg in messages:
+                is_self = msg['sender_id'] == self.nyx_app.identity.device_id
+                sender_name = self.active_contact.get('alias') if not is_self else "You"
+                ts = datetime.fromisoformat(msg['timestamp']) if isinstance(msg['timestamp'], str) else msg['timestamp']
+                chat_messages.mount(ChatMessage(sender_name, msg['content'], ts, is_self))
         
         # Scroll to bottom
         chat_messages.scroll_end(animate=False)

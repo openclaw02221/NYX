@@ -64,18 +64,23 @@ class HelpScreen(ModalScreen[None]):
 ║           NYX v0.0.5 - KEY BINDINGS REFERENCE            ║
 ╠═══════════════════════════════════════════════════════════╣
 ║ GLOBAL BINDINGS:                                         ║
-║   Ctrl+Q     - Quit application                          ║
+║   Ctrl+Q     - Quit application (with confirmation)      ║
 ║   Ctrl+H     - Show this help                            ║
 ║   Ctrl+T     - Cycle theme                               ║
 ║   Ctrl+R     - Force sync messages                       ║
 ║   Ctrl+N     - Add new contact                           ║
+║   Ctrl+G     - Create new group                          ║
 ║   Ctrl+S     - Server settings                           ║
+║   Ctrl+L     - Clear chat display                        ║
+║                                                           ║
+║ CONTACT LIST:                                            ║
+║   Up/Down    - Navigate contacts                         ║
+║   Enter      - Open chat with contact                    ║
+║   Delete     - Delete selected contact                   ║
 ║                                                           ║
 ║ NAVIGATION:                                              ║
 ║   Tab        - Focus next widget                         ║
 ║   Shift+Tab  - Focus previous widget                     ║
-║   Up/Down    - Navigate lists                            ║
-║   Enter      - Select/Activate                           ║
 ║   Escape     - Go back/Cancel                            ║
 ╚═══════════════════════════════════════════════════════════╝
         """
@@ -168,6 +173,61 @@ class AddContactScreen(ModalScreen[Optional[Dict[str, str]]]):
     def cancel(self):
         self.dismiss(None)
 
+class CreateGroupScreen(ModalScreen[Optional[str]]):
+    """Create group dialog."""
+    
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="create_group_modal"):
+            yield Static("╔═══════════ CREATE NEW GROUP ════════════╗", id="create_group_title")
+            yield Input(placeholder="Group name", id="group_name_input")
+            yield Input(placeholder="Description (optional)", id="group_desc_input")
+            with Horizontal(id="create_group_buttons"):
+                yield Button("Create Group", id="create_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+    
+    @on(Button.Pressed, "#create_btn")
+    def create_group(self):
+        name = self.query_one("#group_name_input", Input).value.strip()
+        if name:
+            self.dismiss(name)
+        else:
+            self.notify("Please enter a group name", severity="warning")
+    
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+class ConfirmDialog(ModalScreen[bool]):
+    """Generic confirmation dialog."""
+    
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    
+    def __init__(self, message: str, title: str = "Confirm"):
+        super().__init__()
+        self.message = message
+        self.title = title
+    
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm_modal"):
+            yield Static(f"╔═══════════ {self.title.upper()} ════════════╗", id="confirm_title")
+            yield Label(self.message)
+            with Horizontal(id="confirm_buttons"):
+                yield Button("Yes", id="yes_btn", variant="error")
+                yield Button("No [Esc]", id="no_btn", variant="primary")
+    
+    @on(Button.Pressed, "#yes_btn")
+    def confirm_yes(self):
+        self.dismiss(True)
+    
+    @on(Button.Pressed, "#no_btn")
+    def confirm_no(self):
+        self.dismiss(False)
+    
+    def action_cancel(self):
+        self.dismiss(False)
+
 class NYXApp(App):
     """Main Textual application for NYX."""
 
@@ -219,7 +279,7 @@ class NYXApp(App):
         margin: 0 0 1 0;
     }
     
-    #help_modal, #server_modal, #add_contact_modal {
+    #help_modal, #server_modal, #add_contact_modal, #create_group_modal, #confirm_modal {
         width: 70;
         height: auto;
         background: $panel;
@@ -232,7 +292,7 @@ class NYXApp(App):
         color: $text;
     }
     
-    #server_buttons, #add_contact_buttons {
+    #server_buttons, #add_contact_buttons, #create_group_buttons, #confirm_buttons {
         width: 100%;
         height: auto;
         margin-top: 1;
@@ -245,12 +305,15 @@ class NYXApp(App):
     """
 
     BINDINGS = [
-        Binding("ctrl+q", "quit", "Quit", show=True),
+        Binding("ctrl+q", "quit_confirm", "Quit", show=True),
         Binding("ctrl+h", "show_help", "Help", show=True),
         Binding("ctrl+t", "cycle_theme", "Theme", show=True),
         Binding("ctrl+n", "new_contact", "New", show=True),
+        Binding("ctrl+g", "new_group", "Group", show=True),
         Binding("ctrl+s", "server_settings", "Server", show=True),
         Binding("ctrl+r", "sync", "Sync", show=True),
+        Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("delete", "delete_contact", "Delete", show=False),
         Binding("tab", "focus_next", "Next", show=False),
     ]
 
@@ -411,6 +474,65 @@ class NYXApp(App):
             # TODO: Save to config.toml and reconnect
             self.header_bar.status = f"Server: {result}"
             self.notify(f"✓ Server updated: {result}")
+    
+    async def action_new_group(self) -> None:
+        """Open dialog to create a new group."""
+        if not self.nyx_app:
+            return
+        
+        result = await self.push_screen_wait(CreateGroupScreen())
+        if result:
+            try:
+                # Create group in database
+                room = self.nyx_app.storage.rooms.create(
+                    room_type="private_group",
+                    title=result,
+                    owner_id=self.nyx_app.identity.device_id
+                )
+                self.refresh_contacts()
+                self.notify(f"✓ Created group: {result}")
+            except Exception as e:
+                self.notify(f"Failed to create group: {e}", severity="error")
+    
+    def action_clear_chat(self) -> None:
+        """Clear the chat display (not history)."""
+        chat_messages = self.query_one("#chat_messages", Vertical)
+        for child in chat_messages.children:
+            child.remove()
+        self.notify("Chat display cleared")
+    
+    async def action_delete_contact(self) -> None:
+        """Delete the currently selected contact."""
+        if not self.active_contact or not self.nyx_app:
+            return
+        
+        alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
+        confirm = await self.push_screen_wait(
+            ConfirmDialog(
+                f"Delete contact '{alias}'?\nThis will remove all message history.",
+                title="Delete Contact"
+            )
+        )
+        
+        if confirm:
+            try:
+                device_id = self.active_contact['device_id']
+                # Delete from database
+                self.nyx_app.storage.contacts.delete(device_id)
+                self.active_contact = None
+                self.action_clear_chat()
+                self.refresh_contacts()
+                self.notify(f"✓ Deleted contact: {alias}")
+            except Exception as e:
+                self.notify(f"Failed to delete contact: {e}", severity="error")
+    
+    async def action_quit_confirm(self) -> None:
+        """Confirm before quitting."""
+        confirm = await self.push_screen_wait(
+            ConfirmDialog("Are you sure you want to quit NYX?", title="Quit")
+        )
+        if confirm:
+            self.exit()
 
 if __name__ == "__main__":
     app = NYXApp()

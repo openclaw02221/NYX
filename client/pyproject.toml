@@ -3,8 +3,8 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "nyx-client"
-version = "0.2.0"
+name = "nyx_client"
+version = "0.0.5"
 description = "NYX Terminal-Native Distributed Communication Protocol — Python Client (MVP)"
 readme = "README.md"
 requires-python = ">=3.11"

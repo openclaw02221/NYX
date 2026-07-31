@@ -13,7 +13,9 @@ from pathlib import Path
 from nyx_client import __version__, __whitepaper_version__
 from nyx_client.config import configure_logging, get_logger, load_settings
 from nyx_client.core.app import NyxApp
+from nyx_client.core.backend import TUIBackend
 from nyx_client.ui.repl import ReplUI
+from nyx_client.ui.tui import NYXApp as TUIApp
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,38 +82,24 @@ def main(argv: list[str] | None = None) -> int:
         print("  " + app.last_mnemonic)
         print()
 
-    if args.tui:
-        try:
-            from nyx_client.ui.pro_tui import ProTUI as PanelApp
-        except ImportError:
-            print("error: curses not available; pip install windows-curses", file=sys.stderr)
-            print("or use --repl", file=sys.stderr)
-            app.stop()
-            return 1
-        code = PanelApp(app).run()
-        app.stop()
-        return code
-
+    # Default to TUI if no mode specified
     if args.repl:
         ui = ReplUI(app.command_context())
         code = ui.run()
         app.stop()
         return code
-
-    print()
-    print("  +------------------------------------------+")
-    print("  |          NYX Client  v" + __version__.ljust(18) + "|")
-    print("  |  Whitepaper v" + __whitepaper_version__.ljust(27) + "|")
-    print("  +------------------------------------------+")
-    print()
-    print("  Identity: " + identity.id)
-    print("  Data    : " + str(app.settings.data_dir))
-    print("  Server  : " + app.settings.network.default_server)
-    print()
-    print("  Run with --repl for interactive mode.")
-    print()
-    app.stop()
-    return 0
+    
+    # Launch TUI (default or --tui flag)
+    try:
+        backend = TUIBackend(app)
+        tui_app = TUIApp(nyx_app=backend)
+        tui_app.run()
+        app.stop()
+        return 0
+    except Exception as exc:
+        print("error: TUI failed: " + str(exc), file=sys.stderr)
+        app.stop()
+        return 1
 
 
 if __name__ == "__main__":

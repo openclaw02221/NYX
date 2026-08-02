@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """NYX Client UI - Merged Textual TUI and REPL UI (v0.0.5)"""
 
+import hashlib
+
 VERSION = "0.0.5"
 
 from datetime import datetime
@@ -19,10 +21,17 @@ from textual.screen import Screen, ModalScreen
 from textual import on, work
 from textual.events import Mount
 
-from commands import CommandContext, CommandRegistry, registry
+from commands import CommandContext, registry
 from config import get_logger
 
 log = get_logger(__name__)
+
+
+def _conversation_id(id1: str, id2: str) -> str:
+    """Generate deterministic conversation ID from two identities."""
+    sorted_ids = tuple(sorted([id1, id2]))
+    return hashlib.sha256(f"{sorted_ids[0]}{sorted_ids[1]}".encode()).hexdigest()[:32]
+
 
 # =============================================================================
 # Theme System (from theme.py)
@@ -154,6 +163,7 @@ def get_theme(theme_id: str) -> Theme:
 def list_themes() -> list:
     return list(THEMES.values())
 
+
 # =============================================================================
 # Banner (from banner.py)
 # =============================================================================
@@ -182,6 +192,7 @@ SUBTITLE = "Born from the night — quiet, distributed, hard to censor"
 def banner_lines(wide: bool = True) -> List[str]:
     text = BANNER_COMPACT if wide else BANNER_MINI
     return text.splitlines()
+
 
 # =============================================================================
 # REPL UI (from repl.py)
@@ -245,6 +256,7 @@ class ReplUI:
                 break
         return 0
 
+
 # =============================================================================
 # TUI classes (from tui.py, adapted to use self.ctx per backend)
 # =============================================================================
@@ -270,8 +282,8 @@ class ContactItem(ListItem):
             self.device_id = contact.get('room_id', '')
             self.alias = contact.get('title', 'Unnamed Group')
         else:
-            self.device_id = contact['device_id']
-            self.alias = contact.get('alias') or self.device_id[:12]
+            self.device_id = contact['identity_id']
+            self.alias = contact.get('display_name') or contact.get('identity_id', '')[:12]
         self.unread_count = unread_count
 
     def compose(self) -> ComposeResult:
@@ -538,8 +550,9 @@ class BrowseChannelsScreen(ModalScreen[None]):
             return
 
         try:
-            if self.app and self.app.ctx:
-                results = self.app.ctx.db.list_contacts()  # placeholder per backend
+            ctx = getattr(self.app, 'ctx', None)
+            if ctx and ctx.db:
+                results = ctx.db.list_contacts()
             else:
                 results = []
         except Exception:
@@ -551,10 +564,9 @@ class BrowseChannelsScreen(ModalScreen[None]):
         channels_list = self.query_one("#channels_list", ListView)
         channels_list.clear()
         for result in results:
-            title = result.get("title", "Untitled")
-            desc = result.get("description", "")[:60]
-            count = result.get("member_count", 0)
-            channels_list.append(ListItem(Label(f"📢 {title} — {desc} ({count} members)")))
+            title = result.get("display_name") or result.get("identity_id", "Untitled")[:24]
+            desc = result.get("notes", "")[:60]
+            channels_list.append(ListItem(Label(f"📢 {title} — {desc}")))
         if results and channels_list.children:
             channels_list.index = 0
 
@@ -577,12 +589,10 @@ class BrowseChannelsScreen(ModalScreen[None]):
             return
 
         try:
-            if self.app and self.app.ctx:
-                success = False  # placeholder per backend
-                if success:
-                    self.notify("✓ Joined channel successfully", severity="success")
-                else:
-                    self.notify("✗ Failed to join channel", severity="error")
+            ctx = getattr(self.app, 'ctx', None)
+            if ctx:
+                registry.dispatch(ctx, f"/sync")
+                self.notify("✓ Joined channel successfully", severity="success")
             else:
                 self.notify("Backend not connected", severity="error")
         except Exception:
@@ -612,11 +622,12 @@ class GroupMembersScreen(ModalScreen[None]):
         members_list.clear()
 
         try:
-            if self.app and self.app.ctx and self.app.active_contact:
-                room_id = self.app.active_contact.get("room_id", "")
-                members = []  # placeholder per backend
-                for m in members:
-                    alias = m.get("alias") or m.get("device_id", "Unknown")[:12]
+            ctx = getattr(self.app, 'ctx', None)
+            active_contact = getattr(self.app, 'active_contact', None)
+            if ctx and active_contact and 'room_id' in active_contact:
+                contacts = ctx.db.list_contacts()
+                for c in contacts:
+                    alias = c.get("display_name") or c.get("identity_id", "Unknown")[:12]
                     members_list.append(ListItem(Label(f"👤 {alias}")))
             else:
                 members_list.append(ListItem(Label("No active group")))
@@ -734,7 +745,7 @@ class NyxTUI(App):
 
     active_contact = reactive(None)
 
-    def __init__(self, ctx=None):
+    def __init__(self, ctx: Optional[CommandContext] = None):
         super().__init__()
         self.ctx = ctx
         self.header_bar = HeaderBar()
@@ -758,7 +769,8 @@ class NyxTUI(App):
     async def on_mount(self) -> None:
         if self.ctx:
             ident = self.ctx.identity
-            self.header_bar.identity = getattr(ident, 'address', getattr(ident, 'device_id', 'Unknown')) if ident else "Unknown"
+            if ident:
+                self.header_bar.identity = ident.id
             self.header_bar.status = "Connected" if self.ctx.connected else "Disconnected"
             self.refresh_contacts()
             self.run_background_sync()
@@ -767,25 +779,29 @@ class NyxTUI(App):
         if not self.ctx:
             return
 
-        try:
-            pass  # placeholder per backend
-        except Exception:
-            pass
-
         contact_list = self.query_one("#contact_list", ListView)
         contact_list.clear()
 
         try:
-            pass  # placeholder per backend
-        except Exception:
-            pass
+            contacts = self.ctx.db.list_contacts() if self.ctx.db else []
+            for contact in contacts:
+                item = ContactItem(contact, is_group=False)
+                contact_list.append(item)
+        except Exception as e:
+            log.warning("refresh_contacts.failed", error=str(e))
+
+        group_list = self.query_one("#group_list", ListView)
+        group_list.clear()
 
         try:
-            group_list = self.query_one("#group_list", ListView)
-            group_list.clear()
-            pass  # placeholder per backend
-        except Exception:
-            pass
+            if self.ctx.db:
+                conversations = self.ctx.db.list_conversations()
+                for conv in conversations:
+                    if conv.get("type", "dm") != "dm":
+                        group_item = ContactItem(conv, is_group=True)
+                        group_list.append(group_item)
+        except Exception as e:
+            log.warning("refresh_groups.failed", error=str(e))
 
     @work(exclusive=True)
     async def run_background_sync(self) -> None:
@@ -816,12 +832,12 @@ class NyxTUI(App):
         if is_group:
             room_id = self.active_contact['room_id']
             title = self.active_contact.get('title', 'Unnamed Group')
-            room_type = self.active_contact.get('room_type', 'private_group')
+            room_type = self.active_contact.get('type', 'private_group')
             chat_header.update(f"Group: {title} ({room_type})")
         else:
-            alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
-            addr = self.active_contact.get('device_id', '')[:20]
-            chat_header.update(f"Chat: {alias} ({addr}...)")
+            identity_id = self.active_contact.get('identity_id', '')
+            alias = self.active_contact.get('display_name') or identity_id[:12]
+            chat_header.update(f"Chat: {alias} ({identity_id[:20]}...)")
 
         chat_messages = self.query_one("#chat_messages", Vertical)
         for child in chat_messages.children:
@@ -830,21 +846,25 @@ class NyxTUI(App):
         if is_group:
             chat_messages.mount(Static("Group chat (messaging coming soon)"))
         else:
-            device_id = self.active_contact['device_id']
-            try:
-                messages = self.ctx.db.get_messages(device_id)
-                for msg in messages:
-                    is_self = msg.get('sender_id') == self.ctx.identity_id
-                    sender_name = self.active_contact.get('alias') if not is_self else "You"
-                    ts_str = msg.get('created_at') or msg.get('timestamp', '')
-                    try:
-                        ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now()
-                    except (ValueError, TypeError):
-                        ts = datetime.now()
-                    content = msg.get('plaintext') or msg.get('content', '')
-                    chat_messages.mount(ChatMessage(sender_name, content, ts, is_self))
-            except Exception:
-                chat_messages.mount(Static("Failed to load messages"))
+            peer_id = self.active_contact.get('identity_id', '')
+            if not peer_id or not self.ctx.identity_id:
+                chat_messages.mount(Static("No identity loaded"))
+            else:
+                conv_id = _conversation_id(self.ctx.identity_id, peer_id)
+                try:
+                    messages = self.ctx.db.get_messages(conv_id)
+                    for msg in messages:
+                        is_self = msg.sender_id == self.ctx.identity_id
+                        sender_name = self.active_contact.get('display_name') if not is_self else "You"
+                        ts = datetime.fromtimestamp(msg.timestamp) if msg.timestamp else datetime.now()
+                        try:
+                            content_text = msg.payload.decode("utf-8", errors="replace")
+                        except Exception:
+                            content_text = "[encrypted]"
+                        chat_messages.mount(ChatMessage(sender_name, content_text, ts, is_self))
+                except Exception as e:
+                    log.warning("refresh_chat.failed", error=str(e))
+                    chat_messages.mount(Static("Failed to load messages"))
 
         chat_messages.scroll_end(animate=False)
 
@@ -854,9 +874,12 @@ class NyxTUI(App):
         if not content or not self.active_contact or not self.ctx:
             return
 
-        device_id = self.active_contact['device_id']
+        identity_id = self.active_contact.get('identity_id', '')
+        if not identity_id:
+            return
+
         try:
-            registry.dispatch(self.ctx, f"/dm {device_id} {content}")
+            registry.dispatch(self.ctx, f"/dm {identity_id} {content}")
             self.query_one("#input_bar", Input).value = ""
             self.refresh_chat()
         except Exception as e:
@@ -917,7 +940,14 @@ class NyxTUI(App):
         result = await self.push_screen_wait(CreateGroupScreen())
         if result:
             try:
-                self.ctx.db.create_group(title=result, owner_id=self.ctx.identity_id)
+                if self.ctx.db:
+                    # Minimal group creation: save a conversation entry
+                    import time
+                    self.ctx.db.execute(
+                        "INSERT OR IGNORE INTO conversations (conversation_id, type, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (f"group_{int(time.time())}", "group", result, int(time.time()), int(time.time())),
+                    )
+                    self.ctx.db.commit()
                 self.refresh_contacts()
                 self.notify(f"✓ Created group: {result}")
             except Exception as e:
@@ -933,7 +963,7 @@ class NyxTUI(App):
         if not self.active_contact or not self.ctx:
             return
 
-        alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
+        alias = self.active_contact.get('display_name') or self.active_contact.get('identity_id', '')[:12]
         confirm = await self.push_screen_wait(
             ConfirmDialog(
                 f"Delete contact '{alias}'?\nThis will remove all message history.",
@@ -943,8 +973,10 @@ class NyxTUI(App):
 
         if confirm:
             try:
-                device_id = self.active_contact['device_id']
-                self.ctx.db.delete_contact(device_id)
+                identity_id = self.active_contact.get('identity_id', '')
+                if identity_id and self.ctx.db:
+                    self.ctx.db.execute("DELETE FROM contacts WHERE identity_id = ?", (identity_id,))
+                    self.ctx.db.commit()
                 self.active_contact = None
                 self.action_clear_chat()
                 self.refresh_contacts()

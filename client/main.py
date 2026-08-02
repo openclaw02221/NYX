@@ -1,21 +1,65 @@
-import argparse
-from ui import NyxTUI, ReplUI
-from commands import CommandContext, CommandRegistry, registry
-from config import load_settings
+"""
+NYX Client — Textual TUI / REPL entry point.
+"""
 
-def main():
-    parser = argparse.ArgumentParser()
+import sys
+import argparse
+from commands import CommandContext, registry
+from config import load_settings, configure_logging, get_logger
+from db import NYXDatabase
+from crypto import Identity
+from ui import ReplUI, NyxTUI
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="NYX — Terminal-Native Secure Messaging Client"
+    )
     parser.add_argument("--repl", action="store_true", help="use REPL UI")
     parser.add_argument("--tui", action="store_true", help="use Textual TUI")
     args = parser.parse_args()
 
-    ctx = CommandContext()
-    ctx.load_settings()
+    # Load settings
+    settings = load_settings()
+    configure_logging(level="INFO", json_logs=False)
+    log = get_logger(__name__)
 
-    if args.repl:
-        ReplUI(ctx).run()
+    # Initialize database
+    db_path = settings.storage.database_path()
+    db = NYXDatabase(db_path)
+    db.connect()
+
+    # Load or create identity
+    identity_data = db.load_identity()
+    if identity_data:
+        identity_id = identity_data.get("identity_id", "unknown")
+        identity = Identity.create()  # placeholder until full key restoration
     else:
-        NyxTUI(ctx=ctx).run()
+        identity = Identity.create()
+        identity_id = identity.id
+        db.save_identity(identity_id, identity.public_key_bytes, b"placeholder")
+
+    log.info("identity", id=identity_id)
+
+    # Build command context
+    ctx = CommandContext(
+        identity=identity,
+        identity_id=identity_id,
+        server=settings.network.default_server,
+        connected=False,
+        db=db,
+    )
+
+    # Launch chosen UI
+    if args.repl:
+        ui = ReplUI(ctx)
+        return ui.run()
+    else:
+        # TUI (default when neither --repl nor --tui is specified)
+        app = NyxTUI(ctx=ctx)
+        app.run()
+        return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

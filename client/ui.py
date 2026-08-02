@@ -19,8 +19,8 @@ from textual.screen import Screen, ModalScreen
 from textual import on, work
 from textual.events import Mount
 
-from nyx_client.core.commands import CommandContext, CommandRegistry, registry
-from nyx_client.config.logging import get_logger
+from commands import CommandContext, CommandRegistry, registry
+from config import get_logger
 
 log = get_logger(__name__)
 

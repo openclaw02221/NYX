@@ -1,736 +1,198 @@
-"""
-NYX Client UI Module.
-
-Provides both a legacy REPL interface and a modern Textual TUI.
-Version: 0.0.5
-"""
-
 from __future__ import annotations
 
-import sys
-import asyncio
-import hashlib
-import time
-from datetime import datetime
-from typing import TextIO, Optional, List, Dict, Any
-
-# Textual imports
-from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import (
-    Header,
-    Footer,
-    Static,
-    Input,
-    ListItem,
-    ListView,
-    Label,
-    Button,
-    ContentSwitcher,
-    TextArea,
-    RichLog,
-)
-from textual.binding import Binding
-from textual.screen import ModalScreen, Screen
-from textual.reactive import reactive
-from textual.message import Message as TextualMessage
-
-from commands import CommandContext, CommandRegistry, registry as default_registry
-from config import get_logger
-from db import Message
-
-log = get_logger(__name__)
+"""NYX Client UI - Merged Textual TUI and REPL UI (v0.0.5)"""
 
 VERSION = "0.0.5"
 
-BANNER = f"""
+from datetime import datetime
+import asyncio
+import sys
+from typing import List, Optional, Dict, Any, TextIO
+
+from dataclasses import dataclass
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical
+from textual.widgets import Header, Footer, Static, Input, ListView, ListItem, Label, Button
+from textual.binding import Binding
+from textual.reactive import reactive
+from textual.screen import Screen, ModalScreen
+from textual import on, work
+from textual.events import Mount
+
+from nyx_client.core.commands import CommandContext, CommandRegistry, registry
+from nyx_client.config.logging import get_logger
+
+log = get_logger(__name__)
+
+# =============================================================================
+# Theme System (from theme.py)
+# =============================================================================
+@dataclass(frozen=True)
+class Theme:
+    id: str
+    name: str
+    header_fg: str
+    header_bg: str
+    selected_fg: str
+    selected_bg: str
+    accent: str
+    success: str
+    warning: str
+    error: str
+    muted: str
+    border: str
+    input_fg: str
+    input_bg: str
+
+
+THEMES: Dict[str, Theme] = {
+    "midnight": Theme(
+        id="midnight",
+        name="Midnight (default)",
+        header_fg="cyan",
+        header_bg="black",
+        selected_fg="black",
+        selected_bg="cyan",
+        accent="cyan",
+        success="green",
+        warning="yellow",
+        error="red",
+        muted="white",
+        border="cyan",
+        input_fg="green",
+        input_bg="black",
+    ),
+    "ember": Theme(
+        id="ember",
+        name="Ember",
+        header_fg="red",
+        header_bg="black",
+        selected_fg="black",
+        selected_bg="red",
+        accent="yellow",
+        success="green",
+        warning="yellow",
+        error="red",
+        muted="white",
+        border="red",
+        input_fg="yellow",
+        input_bg="black",
+    ),
+    "forest": Theme(
+        id="forest",
+        name="Forest",
+        header_fg="green",
+        header_bg="black",
+        selected_fg="black",
+        selected_bg="green",
+        accent="green",
+        success="green",
+        warning="yellow",
+        error="red",
+        muted="white",
+        border="green",
+        input_fg="green",
+        input_bg="black",
+    ),
+    "violet": Theme(
+        id="violet",
+        name="Violet",
+        header_fg="magenta",
+        header_bg="black",
+        selected_fg="black",
+        selected_bg="magenta",
+        accent="magenta",
+        success="green",
+        warning="yellow",
+        error="red",
+        muted="white",
+        border="magenta",
+        input_fg="magenta",
+        input_bg="black",
+    ),
+    "mono": Theme(
+        id="mono",
+        name="Mono",
+        header_fg="white",
+        header_bg="black",
+        selected_fg="black",
+        selected_bg="white",
+        accent="white",
+        success="white",
+        warning="white",
+        error="white",
+        muted="white",
+        border="white",
+        input_fg="white",
+        input_bg="black",
+    ),
+    "ocean": Theme(
+        id="ocean",
+        name="Ocean",
+        header_fg="blue",
+        header_bg="black",
+        selected_fg="white",
+        selected_bg="blue",
+        accent="cyan",
+        success="green",
+        warning="yellow",
+        error="red",
+        muted="white",
+        border="blue",
+        input_fg="cyan",
+        input_bg="black",
+    ),
+}
+
+DEFAULT_THEME_ID = "midnight"
+
+
+def get_theme(theme_id: str) -> Theme:
+    return THEMES.get(theme_id, THEMES[DEFAULT_THEME_ID])
+
+
+def list_themes() -> list:
+    return list(THEMES.values())
+
+# =============================================================================
+# Banner (from banner.py)
+# =============================================================================
+BANNER_COMPACT = r"""
+╔══════════════════════════════════════════════════════════════════════╗
+║   ███╗   ██╗██╗   ██╗██╗  ██╗                                        ║
+║   ████╗  ██║╚██╗ ██╔╝╚██╗██╔╝                                        ║
+║   ██╔██╗ ██║ ╚████╔╝  ╚███╔╝                                         ║
+║   ██║╚██╗██║  ╚██╔╝   ██╔██╗                                         ║
+║   ██║ ╚████║   ██║   ██╔╝ ██╗                                        ║
+║   ╚═╝  ╚═══╝   ╚═╝   ╚═╝  ╚═╝                                        ║
+╠══════════════════════════════════════════════════════════════════════╣
+║          Terminal-Native Secure Messaging  ·  Whitepaper v3.0        ║
+╚══════════════════════════════════════════════════════════════════════╝
+""".strip("\n")
+
+BANNER_MINI = r"""
 ┌─────────────────────────────────────────┐
-│         NYX Client v{VERSION}               │
-│  Secure Terminal-Native Communication   │
-│                                         │
-│  Type /help for commands, /exit to quit │
+│  N Y X  ·  secure terminal messenger    │
 └─────────────────────────────────────────┘
-"""
+""".strip("\n")
+
+SUBTITLE = "Born from the night — quiet, distributed, hard to censor"
+
+
+def banner_lines(wide: bool = True) -> List[str]:
+    text = BANNER_COMPACT if wide else BANNER_MINI
+    return text.splitlines()
 
 # =============================================================================
-# MODAL SCREENS
+# REPL UI (from repl.py)
 # =============================================================================
+BANNER = """
+  +------------------------------------------+
+  |          NYX Client  REPL                |
+  |  Type /help for commands, /exit to quit  |
+  +------------------------------------------+
+ """
 
-class HelpScreen(ModalScreen):
-    """Help overlay showing key bindings."""
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label(f"NYX v{VERSION} - Help", id="dialog-title"),
-            Static(
-                "Ctrl+Q / Ctrl+C : Quit\n"
-                "Ctrl+H         : Show this help\n"
-                "Ctrl+T         : Cycle themes\n"
-                "Ctrl+R         : Force sync\n"
-                "Ctrl+N         : Add contact\n"
-                "Ctrl+G         : Create group\n"
-                "Ctrl+S         : Server settings\n"
-                "Ctrl+F         : Search contacts\n"
-                "Ctrl+L         : Clear chat display\n"
-                "Tab            : Switch focus\n"
-                "Esc            : Close / Back",
-                id="help-text"
-            ),
-            Button("Close", variant="primary", id="close-btn"),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss()
-
-class ConfirmDialog(ModalScreen[bool]):
-    """Generic confirmation dialog."""
-    def __init__(self, message: str):
-        super().__init__()
-        self.message = message
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Confirmation", id="dialog-title"),
-            Label(self.message, id="confirm-msg"),
-            Horizontal(
-                Button("Yes", variant="error", id="yes-btn"),
-                Button("No", id="no-btn"),
-                classes="dialog-buttons"
-            ),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "yes-btn")
-
-class AddContactScreen(ModalScreen[Optional[tuple[str, str]]]):
-    """Modal for adding a new contact."""
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Add New Contact", id="dialog-title"),
-            Input(placeholder="nyx1... address", id="contact-address"),
-            Input(placeholder="Alias (optional)", id="contact-alias"),
-            Horizontal(
-                Button("Add", variant="primary", id="add-btn"),
-                Button("Cancel", id="cancel-btn"),
-                classes="dialog-buttons"
-            ),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "add-btn":
-            address = self.query_one("#contact-address", Input).value.strip()
-            alias = self.query_one("#contact-alias", Input).value.strip()
-            self.dismiss((address, alias) if address else None)
-        else:
-            self.dismiss(None)
-
-class CreateGroupScreen(ModalScreen[Optional[str]]):
-    """Modal for creating a group."""
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Create New Group", id="dialog-title"),
-            Input(placeholder="Group name", id="group-name"),
-            Horizontal(
-                Button("Create", variant="primary", id="create-btn"),
-                Button("Cancel", id="cancel-btn"),
-                classes="dialog-buttons"
-            ),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "create-btn":
-            name = self.query_one("#group-name", Input).value.strip()
-            self.dismiss(name if name else None)
-        else:
-            self.dismiss(None)
-
-class ServerSettingsScreen(ModalScreen[Optional[str]]):
-    """Modal for server settings."""
-    def __init__(self, current_url: str):
-        super().__init__()
-        self.current_url = current_url
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Server Settings", id="dialog-title"),
-            Input(value=self.current_url, placeholder="Server URL", id="server-url"),
-            Horizontal(
-                Button("Test", id="test-btn"),
-                Button("Save & Reconnect", variant="primary", id="save-btn"),
-                Button("Cancel", id="cancel-btn"),
-                classes="dialog-buttons"
-            ),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "save-btn":
-            url = self.query_one("#server-url", Input).value.strip()
-            self.dismiss(url if url else None)
-        elif event.button.id == "test-btn":
-            self.app.notify("Testing connection...", severity="info")
-            # Logic for testing would go here
-        else:
-            self.dismiss(None)
-
-class BrowseChannelsScreen(ModalScreen):
-    """Modal for browsing/joining channels."""
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Browse Channels", id="dialog-title"),
-            Input(placeholder="Search channels...", id="search-input"),
-            ListView(id="channels-results"),
-            Horizontal(
-                Button("Join", variant="primary", id="join-btn"),
-                Button("Close", id="close-btn"),
-                classes="dialog-buttons"
-            ),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss()
-
-class GroupMembersScreen(ModalScreen):
-    """Modal showing group members."""
-    def __init__(self, members: list[dict]):
-        super().__init__()
-        self.members = members
-
-    def compose(self) -> ComposeResult:
-        yield Vertical(
-            Label("Group Members", id="dialog-title"),
-            ListView(*[ListItem(Label(f"{m.get('alias', 'Unknown')} ({m.get('identity_id', '')[:12]})")) for m in self.members]),
-            Button("Close", id="close-btn"),
-            id="dialog-container"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss()
-
-# =============================================================================
-# UI COMPONENTS
-# =============================================================================
-
-class ChatBubble(Static):
-    """A single chat message bubble."""
-    def __init__(self, text: str, sender: str, is_own: bool, timestamp: int):
-        super().__init__()
-        self.text = text
-        self.sender = sender
-        self.is_own = is_own
-        self.time_str = datetime.fromtimestamp(timestamp).strftime("%H:%M")
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="bubble " + ("own" if self.is_own else "other")):
-            if not self.is_own:
-                yield Label(self.sender[:16] + "...", classes="sender-name")
-            yield Label(self.text, classes="message-text")
-            yield Label(self.time_str, classes="timestamp")
-
-# =============================================================================
-# MAIN TUI APP
-# =============================================================================
-
-class NyxTUI(App):
-    """NYX Textual User Interface."""
-    
-    TITLE = f"NYX v{VERSION}"
-    
-    CSS = """
-    /* Themes */
-    .matrix { --primary: #00FF00; --accent: #008800; --panel: #002200; --surface: #001100; --text: #00FF00; }
-    .telegram { --primary: #2481CC; --accent: #2481CC; --panel: #FFFFFF; --surface: #F0F0F0; --text: #000000; }
-    .monochrome { --primary: #FFFFFF; --accent: #888888; --panel: #111111; --surface: #000000; --text: #FFFFFF; }
-    .solarized { --primary: #268BD2; --accent: #2AA198; --panel: #073642; --surface: #002B36; --text: #839496; }
-
-    Screen {
-        background: $surface;
-        color: $text;
-    }
-
-    #sidebar {
-        width: 25;
-        background: $panel;
-        border-right: tall $primary;
-    }
-
-    #main-panel {
-        width: 1fr;
-    }
-
-    .panel-container {
-        padding: 1;
-        height: 1fr;
-    }
-
-    .panel-title {
-        text-style: bold;
-        background: $primary;
-        color: $surface;
-        padding: 1;
-        margin-bottom: 1;
-        width: 100%;
-    }
-
-    #chat-view-container {
-        height: 1fr;
-    }
-
-    #conversation-list {
-        width: 30;
-        border-right: solid $primary;
-    }
-
-    #chat-area {
-        height: 1fr;
-    }
-
-    #chat-history {
-        height: 1fr;
-        padding: 1;
-        overflow-y: scroll;
-    }
-
-    #input-bar {
-        height: auto;
-        border-top: solid $primary;
-        padding: 1;
-    }
-
-    #chat-input {
-        width: 1fr;
-    }
-
-    .bubble {
-        margin: 1;
-        padding: 1;
-        max-width: 70%;
-        border-radius: 1;
-    }
-
-    .own {
-        align-horizontal: right;
-        background: $accent;
-        color: white;
-    }
-
-    .other {
-        align-horizontal: left;
-        background: $panel;
-        border: solid $primary;
-    }
-
-    .sender-name {
-        text-style: bold;
-        font-size: 80%;
-        color: $primary;
-    }
-
-    .timestamp {
-        align-horizontal: right;
-        font-size: 70%;
-        opacity: 0.7;
-    }
-
-    #dialog-container {
-        padding: 1 2;
-        background: $surface;
-        border: thick $primary;
-        width: 60;
-        height: auto;
-        align: center middle;
-    }
-
-    #dialog-title {
-        text-style: bold;
-        margin-bottom: 1;
-        text-align: center;
-    }
-
-    .dialog-buttons {
-        margin-top: 1;
-        height: auto;
-        align: right middle;
-    }
-
-    .dialog-buttons Button {
-        margin-left: 1;
-    }
-    
-    #help-text {
-        margin: 1 0;
-    }
-
-    .unread-badge {
-        color: $surface;
-        background: $primary;
-        padding: 0 1;
-        text-style: bold;
-    }
-    
-    .status-header {
-        height: 3;
-        background: $panel;
-        border-bottom: solid $primary;
-        padding: 0 1;
-        align: center middle;
-    }
-    
-    .status-dot {
-        color: #00FF00;
-    }
-    .status-dot.disconnected {
-        color: #FF0000;
-    }
-
-    .profile-field {
-        margin-bottom: 1;
-    }
-    """
-
-    BINDINGS = [
-        Binding("ctrl+q", "quit_app", "Quit", show=True),
-        Binding("ctrl+h", "help", "Help", show=True),
-        Binding("ctrl+t", "cycle_theme", "Theme", show=True),
-        Binding("ctrl+r", "force_sync", "Sync", show=True),
-        Binding("ctrl+n", "add_contact", "Add Contact", show=True),
-        Binding("ctrl+g", "create_group", "New Group", show=True),
-        Binding("ctrl+s", "server_settings", "Settings", show=True),
-        Binding("ctrl+f", "search_contacts", "Search", show=True),
-        Binding("ctrl+l", "clear_chat", "Clear", show=True),
-        Binding("delete", "delete_selected", "Delete", show=False),
-        Binding("tab", "focus_next", "Focus Next", show=False),
-        Binding("escape", "back", "Back", show=False),
-    ]
-
-    theme_list = ["matrix", "telegram", "monochrome", "solarized"]
-    current_theme_idx = 0
-
-    def __init__(self, ctx: CommandContext):
-        super().__init__()
-        self.ctx = ctx
-        self.active_peer = None
-        self.sync_task = None
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="app-container", classes="matrix"):
-            # Custom Header
-            with Horizontal(classes="status-header"):
-                yield Label(f" NYX v{VERSION}  │ ", id="header-version")
-                status_text = "● Connected" if (self.ctx and self.ctx.connected) else "○ Disconnected"
-                yield Label(status_text, id="header-status")
-                yield Label(f"  │  {self.ctx.identity_id[:16]}...  │  ", id="header-id")
-                yield Label(self.theme_list[self.current_theme_idx], id="header-theme")
-
-            with Horizontal():
-                with Vertical(id="sidebar"):
-                    yield ListView(
-                        ListItem(Label("💬 CHATS"), id="menu-chats"),
-                        ListItem(Label("👥 CONTACTS"), id="menu-contacts"),
-                        ListItem(Label("📢 GROUPS"), id="menu-groups"),
-                        ListItem(Label("👤 PROFILE"), id="menu-profile"),
-                        ListItem(Label("⚙️ SETTINGS"), id="menu-settings"),
-                        id="sidebar-menu"
-                    )
-                
-                with ContentSwitcher(initial="chats", id="main-panel"):
-                    # CHATS VIEW
-                    with Horizontal(id="chats"):
-                        yield ListView(id="conversation-list")
-                        with Vertical(id="chat-area"):
-                            yield ScrollableContainer(id="chat-history")
-                            with Horizontal(id="input-bar"):
-                                yield Input(placeholder="Type a message...", id="chat-input")
-                                yield Button("Send", variant="primary", id="send-btn")
-                    
-                    # CONTACTS VIEW
-                    with Vertical(id="contacts", classes="panel-container"):
-                        yield Label("CONTACTS", classes="panel-title")
-                        yield ListView(id="contacts-list")
-                        with Horizontal(classes="dialog-buttons"):
-                            yield Button("[+] Add Contact", variant="primary", id="btn-add-contact")
-                            yield Button("[-] Delete Selected", variant="error", id="btn-del-contact")
-
-                    # GROUPS VIEW
-                    with Vertical(id="groups", classes="panel-container"):
-                        yield Label("GROUPS", classes="panel-title")
-                        yield ListView(id="groups-list")
-                        with Horizontal(classes="dialog-buttons"):
-                            yield Button("[+] Create Group", variant="primary", id="btn-create-group")
-                            yield Button("[🔗] Join via ID", id="btn-join-group")
-                            yield Button("[-] Leave/Delete", variant="error", id="btn-leave-group")
-
-                    # PROFILE VIEW
-                    with Vertical(id="profile", classes="panel-container"):
-                        yield Label("PROFILE", classes="panel-title")
-                        with ScrollableContainer():
-                            yield Label(f"Device ID: {getattr(self.ctx.identity, 'device_id', 'N/A')}", classes="profile-field")
-                            yield Label(f"NYX Address: {self.ctx.identity_id}", classes="profile-field")
-                            yield Label(f"Public Key: {self.ctx.identity.public_key_bytes.hex()[:32]}...", classes="profile-field")
-                            yield Label("Display Name:")
-                            yield Input(placeholder="Your Name", id="profile-name")
-                            yield Label("Bio:")
-                            yield TextArea(id="profile-bio")
-                            yield Button("[💾] Save Profile", variant="primary", id="btn-save-profile")
-
-                    # SETTINGS VIEW
-                    with Vertical(id="settings", classes="panel-container"):
-                        yield Label("SETTINGS", classes="panel-title")
-                        yield Label(f"Current Server: {self.ctx.server}")
-                        yield Input(placeholder="New Server URL", id="settings-server-url")
-                        with Horizontal(classes="dialog-buttons"):
-                            yield Button("[🔌] Test Connection", id="btn-test-server")
-                            yield Button("[💾] Save & Reconnect", variant="primary", id="btn-save-server")
-
-            yield Footer()
-
-    async def on_mount(self) -> None:
-        self.refresh_all()
-        # Start background sync
-        self.sync_task = asyncio.create_task(self.background_sync())
-
-    async def background_sync(self):
-        """Background thread for syncing messages."""
-        while True:
-            try:
-                if self.ctx and self.ctx.connected:
-                    # In a real app, call self.ctx.sync()
-                    pass
-                await asyncio.sleep(5)
-            except Exception as e:
-                log.error(f"Sync error: {e}")
-                await asyncio.sleep(10)
-
-    def refresh_all(self):
-        self.refresh_conversations()
-        self.refresh_contacts()
-        self.refresh_groups()
-
-    def refresh_conversations(self):
-        try:
-            if not self.ctx or not self.ctx.db: return
-            lv = self.query_one("#conversation-list", ListView)
-            lv.clear()
-            convs = self.ctx.db.list_conversations()
-            for c in convs:
-                peer = c.get("peer_id", "Unknown")
-                item = ListItem(Label(f"💬 {peer[:12]}..."), id=f"conv-{peer}")
-                item.peer_id = peer
-                lv.append(item)
-        except Exception as e:
-            self.notify(f"Database error: {e}", severity="error")
-
-    def refresh_contacts(self):
-        try:
-            if not self.ctx or not self.ctx.db: return
-            lv = self.query_one("#contacts-list", ListView)
-            lv.clear()
-            contacts = self.ctx.db.list_contacts()
-            for c in contacts:
-                addr = c.get("identity_id", "")
-                alias = c.get("display_name") or "No Alias"
-                lv.append(ListItem(Label(f"{alias} ({addr[:12]}...)"), id=f"contact-{addr}"))
-        except Exception as e:
-            self.notify(f"Database error: {e}", severity="error")
-
-    def refresh_groups(self):
-        try:
-            if not self.ctx or not self.ctx.db: return
-            lv = self.query_one("#groups-list", ListView)
-            lv.clear()
-            # Placeholder for group listing
-            # groups = self.ctx.db.list_groups()
-        except Exception as e:
-            self.notify(f"Database error: {e}", severity="error")
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if event.list_view.id == "sidebar-menu":
-            menu_map = {
-                "menu-chats": "chats",
-                "menu-contacts": "contacts",
-                "menu-groups": "groups",
-                "menu-profile": "profile",
-                "menu-settings": "settings"
-            }
-            target = menu_map.get(event.item.id)
-            if target:
-                self.query_one("#main-panel", ContentSwitcher).current = target
-        
-        elif event.list_view.id == "conversation-list":
-            peer = getattr(event.item, "peer_id", None)
-            if peer:
-                self.load_chat(peer)
-
-    def load_chat(self, peer_id: str):
-        try:
-            self.active_peer = peer_id
-            history = self.query_one("#chat-history", ScrollableContainer)
-            for child in history.children:
-                child.remove()
-            
-            if not self.ctx.db: return
-            
-            # Deterministic conversation ID
-            sorted_ids = tuple(sorted([self.ctx.identity_id, peer_id]))
-            conv_id = hashlib.sha256(f"{sorted_ids[0]}{sorted_ids[1]}".encode()).hexdigest()[:32]
-            
-            messages = self.ctx.db.get_messages(conv_id, limit=50)
-            for msg in messages:
-                is_own = msg.sender_id == self.ctx.identity_id
-                history.mount(ChatBubble(
-                    text=msg.payload.decode("utf-8", errors="replace"),
-                    sender=msg.sender_id,
-                    is_own=is_own,
-                    timestamp=msg.timestamp
-                ))
-            history.scroll_end(animate=False)
-        except Exception as e:
-            self.notify(f"Error loading chat: {e}", severity="error")
-
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "chat-input":
-            await self.send_msg()
-
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        btn_id = event.button.id
-        if btn_id == "send-btn":
-            await self.send_msg()
-        elif btn_id == "btn-add-contact":
-            await self.action_add_contact()
-        elif btn_id == "btn-del-contact":
-            await self.delete_selected_contact()
-        elif btn_id == "btn-create-group":
-            await self.action_create_group()
-        elif btn_id == "btn-save-profile":
-            await self.save_profile()
-        elif btn_id == "btn-save-server":
-            await self.save_server()
-
-    async def send_msg(self):
-        if not self.active_peer:
-            self.notify("Select a chat first", severity="warning")
-            return
-        
-        inp = self.query_one("#chat-input", Input)
-        text = inp.value.strip()
-        if not text: return
-
-        try:
-            # Backend call integration
-            # We simulate saving to DB and updating UI
-            peer_id = self.active_peer
-            me = self.ctx.identity_id
-            sorted_ids = tuple(sorted([me, peer_id]))
-            conv_id = hashlib.sha256(f"{sorted_ids[0]}{sorted_ids[1]}".encode()).hexdigest()[:32]
-            
-            self.ctx.db.ensure_conversation(conv_id, peer_id)
-            ts = int(time.time())
-            msg_id = hashlib.sha256(f"{me}{peer_id}{ts}".encode()).hexdigest()[:32]
-            
-            new_msg = Message(
-                message_id=msg_id,
-                conversation_id=conv_id,
-                sender_id=me,
-                payload=text.encode("utf-8"),
-                sequence=1, # simplified
-                timestamp=ts,
-                direction="out",
-                status="sent"
-            )
-            self.ctx.db.save_message(new_msg)
-            
-            history = self.query_one("#chat-history", ScrollableContainer)
-            history.mount(ChatBubble(text, me, True, ts))
-            history.scroll_end()
-            inp.value = ""
-            self.refresh_conversations()
-        except Exception as e:
-            self.notify(f"Failed to send: {e}", severity="error")
-
-    # Action Handlers
-    async def action_quit_app(self):
-        def check_quit(quit):
-            if quit: self.exit()
-        self.push_screen(ConfirmDialog("Are you sure you want to quit?"), check_quit)
-
-    async def action_help(self):
-        self.push_screen(HelpScreen())
-
-    async def action_cycle_theme(self):
-        self.current_theme_idx = (self.current_theme_idx + 1) % len(self.theme_list)
-        new_theme = self.theme_list[self.current_theme_idx]
-        container = self.query_one("#app-container")
-        for t in self.theme_list:
-            container.remove_class(t)
-        container.add_class(new_theme)
-        self.query_one("#header-theme", Label).update(new_theme)
-
-    async def action_force_sync(self):
-        self.notify("Syncing with server...")
-        # try: self.ctx.sync()
-        self.refresh_all()
-
-    async def action_add_contact(self):
-        def handle_add(res):
-            if res:
-                addr, alias = res
-                try:
-                    self.ctx.db.save_contact(addr, alias)
-                    self.notify(f"Added {alias or addr[:12]}")
-                    self.refresh_contacts()
-                except Exception as e:
-                    self.notify(str(e), severity="error")
-        self.push_screen(AddContactScreen(), handle_add)
-
-    async def action_create_group(self):
-        def handle_create(name):
-            if name:
-                self.notify(f"Group '{name}' created (simulated)")
-        self.push_screen(CreateGroupScreen(), handle_create)
-
-    async def action_server_settings(self):
-        def handle_server(url):
-            if url:
-                self.ctx.server = url
-                self.notify(f"Server set to {url}")
-        self.push_screen(ServerSettingsScreen(self.ctx.server or ""), handle_server)
-
-    async def action_search_contacts(self):
-        self.notify("Search not implemented yet")
-
-    async def action_clear_chat(self):
-        history = self.query_one("#chat-history", ScrollableContainer)
-        for child in history.children:
-            child.remove()
-
-    async def delete_selected_contact(self):
-        # Implementation depends on selection
-        self.notify("Select a contact to delete")
-
-    async def save_profile(self):
-        name = self.query_one("#profile-name", Input).value
-        bio = self.query_one("#profile-bio", TextArea).text
-        try:
-            if hasattr(self.ctx, 'update_profile'):
-                self.ctx.update_profile(name, bio)
-            else:
-                self.notify("Feature coming soon", severity="info")
-        except Exception as e:
-            self.notify(str(e), severity="error")
-
-    async def save_server(self):
-        url = self.query_one("#settings-server-url", Input).value
-        if url:
-            self.ctx.server = url
-            self.notify("Server updated")
-
-# =============================================================================
-# Legacy REPL UI Wrapper
-# =============================================================================
 
 class ReplUI:
     """Simple line-oriented terminal interface."""
@@ -743,17 +205,15 @@ class ReplUI:
         stdout: Optional[TextIO] = None,
     ) -> None:
         self.ctx = ctx
-        self.commands = commands or default_registry
+        self.commands = commands or registry
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
 
     def print(self, text: str) -> None:
-        """Print text to stdout."""
         self.stdout.write(text + "\n")
         self.stdout.flush()
 
     def run_line(self, line: str) -> bool:
-        """Process one input line."""
         result = self.commands.dispatch(self.ctx, line)
         if result.message == "__EXIT__":
             self.print("Goodbye.")
@@ -764,21 +224,10 @@ class ReplUI:
         return True
 
     def run(self) -> int:
-        """Entry point for UI. Detects whether to run TUI or REPL."""
-        if "--repl" in sys.argv:
-            return self._run_repl()
-        else:
-            app = NyxTUI(self.ctx)
-            app.run()
-            return 0
-
-    def _run_repl(self) -> int:
-        """Interactive REPL loop."""
         self.print(BANNER)
         if self.ctx.identity_id:
-            self.print(f"  Identity: {self.ctx.identity_id}")
+            self.print("  Identity: " + self.ctx.identity_id)
         self.print("")
-        
         while True:
             try:
                 self.stdout.write("nyx> ")
@@ -797,29 +246,735 @@ class ReplUI:
         return 0
 
 # =============================================================================
-# Helper display functions
+# TUI classes (from tui.py, adapted to use self.ctx per backend)
 # =============================================================================
+class HeaderBar(Static):
+    """Custom header for NYX."""
 
-def display_welcome(identity_id: str, mnemonic: Optional[str] = None) -> None:
-    """Display welcome message for new or existing identity."""
-    if mnemonic:
-        print("\n" + "=" * 60)
-        print("  *** NEW IDENTITY CREATED ***")
-        print(f"  {identity_id}")
-        print()
-        print("  Recovery mnemonic (store offline, never share):")
-        print(f"  {mnemonic}")
-        print("=" * 60 + "\n")
-    else:
-        print(f"\nLoaded identity: {identity_id}\n")
+    status = reactive("Disconnected")
+    identity = reactive("Unknown")
+    theme_name = reactive("default")
 
-def display_error(message: str) -> None:
-    """Display error message."""
-    print(f"Error: {message}", file=sys.stderr)
+    def render(self) -> str:
+        return f" NYX v0.0.5 │ {self.status} │ {self.identity} │ Theme: {self.theme_name} "
 
-def display_status(connected: bool, server: str, identity: str) -> None:
-    """Display current status."""
-    status = "connected" if connected else "disconnected"
-    print(f"\nStatus: {status}")
-    print(f"Server: {server}")
-    print(f"Identity: {identity[:32]}...\n")
+
+class ContactItem(ListItem):
+    """An item in the contact list (contact or group)."""
+
+    def __init__(self, contact: Dict[str, Any], unread_count: int = 0, is_group: bool = False):
+        super().__init__()
+        self.contact = contact
+        self.is_group = is_group
+        if is_group:
+            self.device_id = contact.get('room_id', '')
+            self.alias = contact.get('title', 'Unnamed Group')
+        else:
+            self.device_id = contact['device_id']
+            self.alias = contact.get('alias') or self.device_id[:12]
+        self.unread_count = unread_count
+
+    def compose(self) -> ComposeResult:
+        unread_badge = f" [{self.unread_count}]" if self.unread_count > 0 else ""
+        prefix = "◆" if self.is_group else "●"
+        yield Label(f"{prefix} {self.alias}{unread_badge}")
+
+
+class ChatMessage(Static):
+    """A single message bubble with improved styling."""
+
+    def __init__(
+        self,
+        sender: str,
+        content: str,
+        timestamp: datetime,
+        is_self: bool = False,
+        is_group: bool = False
+    ):
+        super().__init__()
+        self.sender = sender
+        self.content = content
+        self.timestamp = timestamp
+        self.is_self = is_self
+        self.is_group = is_group
+
+    def render(self) -> str:
+        time_str = self.timestamp.strftime("%H:%M")
+        sender_name = "You" if self.is_self else self.sender
+
+        if self.is_self:
+            bg = "green"
+            align = "right"
+        else:
+            bg = "blue"
+            align = "left"
+
+        time_label = f"[#{align}_end][right]{time_str}[/right][/#align_end]"
+
+        if self.is_self:
+            line = f"[#self]{sender_name}: {self.content}[/]"
+            line += f"\n{time_label}"
+        else:
+            if self.is_group:
+                line = f"[#group]{self.sender}: {self.content}[/]"
+                line += f"\n{time_label}"
+            else:
+                line = f"[#message]{self.content}[/]"
+
+        return f"[{bg}]{line}[/{bg}]"
+
+
+class HelpScreen(ModalScreen[None]):
+    """Help overlay showing all key bindings."""
+
+    BINDINGS = [("escape", "dismiss", "Close")]
+
+    def compose(self) -> ComposeResult:
+        help_text = """
+╔═══════════════════════════════════════════════════════════╗
+║           NYX v0.0.5 - KEY BINDINGS REFERENCE            ║
+╠═══════════════════════════════════════════════════════════╣
+║ GLOBAL BINDINGS:                                         ║
+║   Ctrl+Q     - Quit application (with confirmation)      ║
+║   Ctrl+H     - Show this help                            ║
+║   Ctrl+T     - Cycle theme                               ║
+║   Ctrl+R     - Force sync messages                       ║
+║   Ctrl+N     - Add new contact                           ║
+║   Ctrl+G     - Create new group                          ║
+║   Ctrl+S     - Server settings                           ║
+║   Ctrl+L     - Clear chat display                        ║
+║   Ctrl+P     - Browse channels / public groups           ║
+║   Ctrl+M     - Show group members (active group only)    ║
+║                                                           ║
+║ CONTACT LIST:                                            ║
+║   Up/Down    - Navigate contacts                         ║
+║   Enter      - Open chat with contact                    ║
+║   Delete     - Delete selected contact                   ║
+║                                                           ║
+║ NAVIGATION:                                              ║
+║   Tab        - Focus next widget                         ║
+║   Shift+Tab  - Focus previous widget                     ║
+║   Escape     - Go back/Cancel                            ║
+╚═══════════════════════════════════════════════════════════╝
+        """
+        with Container(id="help_modal"):
+            yield Static(help_text, id="help_content")
+            yield Button("Close [Esc]", id="help_close_btn")
+
+    @on(Button.Pressed, "#help_close_btn")
+    def close_help(self):
+        self.dismiss()
+
+
+class ServerSettingsScreen(ModalScreen[Optional[str]]):
+    """Server settings dialog."""
+
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+
+    def __init__(self, current_url: str):
+        super().__init__()
+        self.current_url = current_url
+
+    def compose(self) -> ComposeResult:
+        with Container(id="server_modal"):
+            yield Static("╔═══════════ SERVER SETTINGS ════════════╗", id="server_title")
+            yield Label(f"Current: {self.current_url}")
+            yield Input(placeholder="Enter new server URL", id="server_url_input")
+            yield Static("", id="test_result")
+            with Horizontal(id="server_buttons"):
+                yield Button("Test Connection", id="test_btn", variant="primary")
+                yield Button("Save & Reconnect", id="save_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+
+    @on(Button.Pressed, "#test_btn")
+    async def test_connection(self):
+        input_widget = self.query_one("#server_url_input", Input)
+        url = input_widget.value.strip()
+        if not url:
+            self.query_one("#test_result", Static).update("⚠ Please enter a URL")
+            return
+
+        result_widget = self.query_one("#test_result", Static)
+        result_widget.update("⏳ Testing connection...")
+
+        try:
+            import requests
+            response = requests.get(f"{url}/api/v3/health", timeout=5)
+            if response.status_code == 200:
+                result_widget.update("✓ Connected successfully")
+            else:
+                result_widget.update(f"✗ Failed: HTTP {response.status_code}")
+        except Exception as e:
+            result_widget.update(f"✗ Failed: {str(e)[:50]}")
+
+    @on(Button.Pressed, "#save_btn")
+    def save_settings(self):
+        input_widget = self.query_one("#server_url_input", Input)
+        url = input_widget.value.strip()
+        if url:
+            self.dismiss(url)
+        else:
+            self.query_one("#test_result", Static).update("⚠ Please enter a URL")
+
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+
+class AddContactScreen(ModalScreen[Optional[Dict[str, str]]]):
+    """Add contact dialog."""
+
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="add_contact_modal"):
+            yield Static("╔═══════════ ADD NEW CONTACT ════════════╗", id="add_contact_title")
+            yield Input(placeholder="Paste nyx1... address", id="contact_address_input")
+            yield Input(placeholder="Alias (optional)", id="contact_alias_input")
+            with Horizontal(id="add_contact_buttons"):
+                yield Button("Add Contact", id="add_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+
+    @on(Button.Pressed, "#add_btn")
+    def add_contact(self):
+        address = self.query_one("#contact_address_input", Input).value.strip()
+        alias = self.query_one("#contact_alias_input", Input).value.strip()
+        if address:
+            self.dismiss({"address": address, "alias": alias})
+        else:
+            self.notify("Please enter a nyx address", severity="warning")
+
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+
+class CreateGroupScreen(ModalScreen[Optional[str]]):
+    """Create group dialog."""
+
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="create_group_modal"):
+            yield Static("╔═══════════ CREATE NEW GROUP ════════════╗", id="create_group_title")
+            yield Input(placeholder="Group name", id="group_name_input")
+            yield Input(placeholder="Description (optional)", id="group_desc_input")
+            with Horizontal(id="create_group_buttons"):
+                yield Button("Create Group", id="create_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+
+    @on(Button.Pressed, "#create_btn")
+    def create_group(self):
+        name = self.query_one("#group_name_input", Input).value.strip()
+        if name:
+            self.dismiss(name)
+        else:
+            self.notify("Please enter a group name", severity="warning")
+
+    @on(Button.Pressed, "#cancel_btn")
+    def cancel(self):
+        self.dismiss(None)
+
+
+class ConfirmDialog(ModalScreen[bool]):
+    """Generic confirmation dialog."""
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str, title: str = "Confirm"):
+        super().__init__()
+        self.message = message
+        self.title = title
+
+    def compose(self) -> ComposeResult:
+        with Container(id="confirm_modal"):
+            yield Static(f"╔═══════════ {self.title.upper()} ════════════╗", id="confirm_title")
+            yield Label(self.message)
+            with Horizontal(id="confirm_buttons"):
+                yield Button("Yes", id="yes_btn", variant="error")
+                yield Button("No [Esc]", id="no_btn", variant="primary")
+
+    @on(Button.Pressed, "#yes_btn")
+    def confirm_yes(self):
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#no_btn")
+    def confirm_no(self):
+        self.dismiss(False)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class BrowseChannelsScreen(ModalScreen[None]):
+    """Channel browser with search and join."""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="browse_channels_modal"):
+            yield Static("╔═══════════ CHANNELS / PUBLIC GROUPS ════════════╗", id="browse_title")
+            yield Input(placeholder="Search channels...", id="search_input")
+            yield ListView(id="channels_list")
+            yield Label("or paste channel ID (private group invite):", id="invite_label")
+            yield Input(placeholder="channel ID", id="invite_input")
+            with Horizontal(id="browse_buttons"):
+                yield Button("Join", id="join_btn", variant="success")
+                yield Button("Cancel [Esc]", id="cancel_btn")
+
+    @on(Input.Submitted, "#search_input")
+    def on_search_submitted(self, event: Input.Submitted) -> None:
+        self._perform_search()
+
+    @on(Button.Pressed, "#join_btn")
+    def on_join_pressed(self) -> None:
+        self._perform_join()
+
+    def on_mount(self) -> None:
+        self._perform_search()
+
+    def _perform_search(self) -> None:
+        query = self.query_one("#search_input", Input).value.strip()
+        if not query:
+            self._update_list([])
+            return
+
+        try:
+            if self.app and self.app.ctx:
+                results = self.app.ctx.db.list_contacts()  # placeholder per backend
+            else:
+                results = []
+        except Exception:
+            results = []
+
+        self._update_list(results)
+
+    def _update_list(self, results: List[Dict]) -> None:
+        channels_list = self.query_one("#channels_list", ListView)
+        channels_list.clear()
+        for result in results:
+            title = result.get("title", "Untitled")
+            desc = result.get("description", "")[:60]
+            count = result.get("member_count", 0)
+            channels_list.append(ListItem(Label(f"📢 {title} — {desc} ({count} members)")))
+        if results and channels_list.children:
+            channels_list.index = 0
+
+    def _perform_join(self) -> None:
+        channels_list = self.query_one("#channels_list", ListView)
+        invite_input = self.query_one("#invite_input", Input)
+        join_btn = self.query_one("#join_btn", Button)
+
+        selected = channels_list.children[channels_list.index] if channels_list.children else None
+        if selected and selected.children:
+            label_text = selected.children[0].renderable.plain
+            try:
+                channel_id = label_text.split("—", 1)[0].replace("📢", "").strip()
+            except (IndexError, AttributeError):
+                channel_id = ""
+        else:
+            channel_id = invite_input.value.strip()
+
+        if not channel_id:
+            return
+
+        try:
+            if self.app and self.app.ctx:
+                success = False  # placeholder per backend
+                if success:
+                    self.notify("✓ Joined channel successfully", severity="success")
+                else:
+                    self.notify("✗ Failed to join channel", severity="error")
+            else:
+                self.notify("Backend not connected", severity="error")
+        except Exception:
+            self.notify("✗ Failed to join channel", severity="error")
+        finally:
+            self.dismiss()
+
+
+class GroupMembersScreen(ModalScreen[None]):
+    """Group members list."""
+
+    def compose(self) -> ComposeResult:
+        with Container(id="group_members_modal"):
+            yield Static("╔═══════════ GROUP MEMBERS ════════════╗", id="members_title")
+            yield ListView(id="members_list")
+            yield Button("Close [Esc]", id="members_close_btn")
+
+    @on(Button.Pressed, "#members_close_btn")
+    def close(self):
+        self.dismiss()
+
+    def on_mount(self) -> None:
+        self._load_members()
+
+    def _load_members(self) -> None:
+        members_list = self.query_one("#members_list", ListView)
+        members_list.clear()
+
+        try:
+            if self.app and self.app.ctx and self.app.active_contact:
+                room_id = self.app.active_contact.get("room_id", "")
+                members = []  # placeholder per backend
+                for m in members:
+                    alias = m.get("alias") or m.get("device_id", "Unknown")[:12]
+                    members_list.append(ListItem(Label(f"👤 {alias}")))
+            else:
+                members_list.append(ListItem(Label("No active group")))
+        except Exception:
+            members_list.append(ListItem(Label("Feature not available yet")))
+
+
+class NyxTUI(App):
+    """Main Textual application for NYX."""
+
+    TITLE = f"NYX v0.0.5"
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+
+    #main_container {
+        layout: horizontal;
+    }
+
+    #sidebar {
+        width: 30;
+        background: $panel;
+        border-right: tall $primary;
+    }
+
+    #chat_area {
+        width: 1fr;
+        layout: vertical;
+    }
+
+    #chat_header {
+        height: 1;
+        background: $panel;
+        padding: 0 1;
+        border-bottom: solid $primary;
+    }
+
+    #chat_messages {
+        height: 1fr;
+        overflow-y: scroll;
+        padding: 1;
+        border-bottom: solid $primary;
+    }
+
+    #input_bar {
+        height: 3;
+        margin: 0 1;
+    }
+
+    #channels_list, #members_list {
+        height: 1fr;
+        border: none;
+    }
+
+    #browse_channels_modal, #group_members_modal, #server_modal,
+    #add_contact_modal, #create_group_modal, #confirm_modal,
+    #help_modal {
+        width: 70;
+        height: auto;
+        background: $panel;
+        border: thick $primary;
+        padding: 1 2;
+    }
+
+    #browse_buttons, #server_buttons, #add_contact_buttons,
+    #create_group_buttons, #confirm_buttons {
+        width: 100%;
+        height: auto;
+        margin-top: 1;
+        align: center middle;
+    }
+
+    Button {
+        margin: 0 1;
+    }
+
+    ChatMessage {
+        padding: 1 2;
+        margin: 0 0 1 0;
+    }
+
+    .self-bubble {
+        background: green;
+    }
+
+    .other-bubble {
+        background: blue;
+    }
+
+    .self {
+        text-align: right;
+    }
+
+    .group {
+        text-align: left;
+        margin-top: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("ctrl+q", "quit_confirm", "Quit", show=True),
+        Binding("ctrl+h", "show_help", "Help", show=True),
+        Binding("ctrl+t", "cycle_theme", "Theme", show=True),
+        Binding("ctrl+r", "sync", "Sync", show=True),
+        Binding("ctrl+n", "new_contact", "New", show=True),
+        Binding("ctrl+g", "new_group", "Group", show=True),
+        Binding("ctrl+s", "server_settings", "Server", show=True),
+        Binding("ctrl+l", "clear_chat", "Clear", show=True),
+        Binding("delete", "delete_contact", "Delete", show=False),
+        Binding("tab", "focus_next", "Next", show=False),
+        Binding("ctrl+p", "browse_channels", "Channels", show=True),
+        Binding("ctrl+m", "group_members", "Members", show=False),
+    ]
+
+    active_contact = reactive(None)
+
+    def __init__(self, ctx=None):
+        super().__init__()
+        self.ctx = ctx
+        self.header_bar = HeaderBar()
+        self.theme_cycle = ["midnight", "ember", "forest", "violet", "mono", "ocean"]
+        self.current_theme_index = 0
+
+    def compose(self) -> ComposeResult:
+        yield self.header_bar
+        with Horizontal(id="main_container"):
+            with Vertical(id="sidebar"):
+                yield Label(" CONTACTS ", id="sidebar_title")
+                yield ListView(id="contact_list")
+                yield Label(" CHANNELS / GROUPS ", id="sidebar_title_groups")
+                yield ListView(id="group_list")
+            with Vertical(id="chat_area"):
+                yield Static("", id="chat_header")
+                yield Vertical(id="chat_messages")
+                yield Input(placeholder="Type a message...", id="input_bar")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        if self.ctx:
+            ident = self.ctx.identity
+            self.header_bar.identity = getattr(ident, 'address', getattr(ident, 'device_id', 'Unknown')) if ident else "Unknown"
+            self.header_bar.status = "Connected" if self.ctx.connected else "Disconnected"
+            self.refresh_contacts()
+            self.run_background_sync()
+
+    def refresh_contacts(self) -> None:
+        if not self.ctx:
+            return
+
+        try:
+            pass  # placeholder per backend
+        except Exception:
+            pass
+
+        contact_list = self.query_one("#contact_list", ListView)
+        contact_list.clear()
+
+        try:
+            pass  # placeholder per backend
+        except Exception:
+            pass
+
+        try:
+            group_list = self.query_one("#group_list", ListView)
+            group_list.clear()
+            pass  # placeholder per backend
+        except Exception:
+            pass
+
+    @work(exclusive=True)
+    async def run_background_sync(self) -> None:
+        while True:
+            if self.ctx and self.ctx.connected:
+                try:
+                    registry.dispatch(self.ctx, "/sync")
+                    self.refresh_contacts()
+                    if self.active_contact:
+                        self.refresh_chat()
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
+
+    @on(ListView.Selected)
+    def on_contact_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, ContactItem):
+            self.active_contact = event.item.contact
+            self.refresh_chat()
+
+    def refresh_chat(self) -> None:
+        if not self.active_contact or not self.ctx:
+            return
+
+        is_group = 'room_id' in self.active_contact
+
+        chat_header = self.query_one("#chat_header", Static)
+        if is_group:
+            room_id = self.active_contact['room_id']
+            title = self.active_contact.get('title', 'Unnamed Group')
+            room_type = self.active_contact.get('room_type', 'private_group')
+            chat_header.update(f"Group: {title} ({room_type})")
+        else:
+            alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
+            addr = self.active_contact.get('device_id', '')[:20]
+            chat_header.update(f"Chat: {alias} ({addr}...)")
+
+        chat_messages = self.query_one("#chat_messages", Vertical)
+        for child in chat_messages.children:
+            child.remove()
+
+        if is_group:
+            chat_messages.mount(Static("Group chat (messaging coming soon)"))
+        else:
+            device_id = self.active_contact['device_id']
+            try:
+                messages = self.ctx.db.get_messages(device_id)
+                for msg in messages:
+                    is_self = msg.get('sender_id') == self.ctx.identity_id
+                    sender_name = self.active_contact.get('alias') if not is_self else "You"
+                    ts_str = msg.get('created_at') or msg.get('timestamp', '')
+                    try:
+                        ts = datetime.fromisoformat(ts_str) if ts_str else datetime.now()
+                    except (ValueError, TypeError):
+                        ts = datetime.now()
+                    content = msg.get('plaintext') or msg.get('content', '')
+                    chat_messages.mount(ChatMessage(sender_name, content, ts, is_self))
+            except Exception:
+                chat_messages.mount(Static("Failed to load messages"))
+
+        chat_messages.scroll_end(animate=False)
+
+    @on(Input.Submitted, "#input_bar")
+    async def on_message_submitted(self, event: Input.Submitted) -> None:
+        content = event.value.strip()
+        if not content or not self.active_contact or not self.ctx:
+            return
+
+        device_id = self.active_contact['device_id']
+        try:
+            registry.dispatch(self.ctx, f"/dm {device_id} {content}")
+            self.query_one("#input_bar", Input).value = ""
+            self.refresh_chat()
+        except Exception as e:
+            self.notify(f"Failed to send message: {e}", severity="error")
+
+    def action_sync(self) -> None:
+        if self.ctx:
+            try:
+                registry.dispatch(self.ctx, "/sync")
+                self.refresh_contacts()
+                self.refresh_chat()
+                self.notify("Synced with server")
+            except Exception as e:
+                self.notify(f"Sync failed: {e}", severity="error")
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpScreen())
+
+    def action_cycle_theme(self) -> None:
+        self.current_theme_index = (self.current_theme_index + 1) % len(self.theme_cycle)
+        theme_name = self.theme_cycle[self.current_theme_index]
+        self.header_bar.theme_name = theme_name
+        self.notify(f"Theme: {theme_name}")
+
+    async def action_new_contact(self) -> None:
+        result = await self.push_screen_wait(AddContactScreen())
+        if result and self.ctx:
+            try:
+                self.ctx.db.save_contact(result["address"], result["alias"])
+                self.refresh_contacts()
+                self.notify(f"✓ Added contact: {result['alias'] or result['address'][:12]}")
+            except Exception as e:
+                self.notify(f"Failed to add contact: {e}", severity="error")
+
+    async def action_server_settings(self) -> None:
+        if not self.ctx:
+            return
+
+        try:
+            current_url = getattr(self.ctx, 'server', 'Unknown')
+            result = await self.push_screen_wait(ServerSettingsScreen(current_url))
+
+            if result:
+                try:
+                    self.ctx.server = result
+                    registry.dispatch(self.ctx, "/sync")
+                    self.header_bar.status = f"Server: {result}"
+                    self.notify(f"✓ Server updated: {result}")
+                except Exception as e:
+                    self.notify(f"Server update failed: {e}", severity="error")
+        except Exception as e:
+            self.notify(f"Server settings failed: {e}", severity="error")
+
+    async def action_new_group(self) -> None:
+        if not self.ctx:
+            return
+
+        result = await self.push_screen_wait(CreateGroupScreen())
+        if result:
+            try:
+                self.ctx.db.create_group(title=result, owner_id=self.ctx.identity_id)
+                self.refresh_contacts()
+                self.notify(f"✓ Created group: {result}")
+            except Exception as e:
+                self.notify(f"Failed to create group: {e}", severity="error")
+
+    def action_clear_chat(self) -> None:
+        chat_messages = self.query_one("#chat_messages", Vertical)
+        for child in chat_messages.children:
+            child.remove()
+        self.notify("Chat display cleared")
+
+    async def action_delete_contact(self) -> None:
+        if not self.active_contact or not self.ctx:
+            return
+
+        alias = self.active_contact.get('alias') or self.active_contact['device_id'][:12]
+        confirm = await self.push_screen_wait(
+            ConfirmDialog(
+                f"Delete contact '{alias}'?\nThis will remove all message history.",
+                title="Delete Contact"
+            )
+        )
+
+        if confirm:
+            try:
+                device_id = self.active_contact['device_id']
+                self.ctx.db.delete_contact(device_id)
+                self.active_contact = None
+                self.action_clear_chat()
+                self.refresh_contacts()
+                self.notify(f"✓ Deleted contact: {alias}")
+            except Exception as e:
+                self.notify(f"Failed to delete contact: {e}", severity="error")
+
+    async def action_browse_channels(self) -> None:
+        if not self.ctx:
+            self.notify("Backend not connected", severity="error")
+            return
+        self.push_screen(BrowseChannelsScreen())
+
+    async def action_group_members(self) -> None:
+        if not self.ctx or not self.active_contact:
+            self.notify("No active group", severity="warning")
+            return
+        if 'room_id' not in self.active_contact:
+            self.notify("Not a group chat", severity="warning")
+            return
+        self.push_screen(GroupMembersScreen())
+
+    async def action_quit_confirm(self) -> None:
+        confirm = await self.push_screen_wait(
+            ConfirmDialog("Are you sure you want to quit NYX?", title="Quit")
+        )
+        if confirm:
+            self.exit()
+
+
+if __name__ == "__main__":
+    app = NyxTUI()
+    app.run()

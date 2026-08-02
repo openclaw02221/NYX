@@ -904,54 +904,45 @@ class NyxTUI(App):
         self.header_bar.theme_name = theme_name
         self.notify(f"Theme: {theme_name}")
 
-    async def action_new_contact(self) -> None:
-        result = await self.push_screen_wait(AddContactScreen())
-        if result and self.ctx:
-            try:
-                self.ctx.db.save_contact(result["address"], result["alias"])
-                self.refresh_contacts()
-                self.notify(f"✓ Added contact: {result['alias'] or result['address'][:12]}")
-            except Exception as e:
-                self.notify(f"Failed to add contact: {e}", severity="error")
+    def action_new_contact(self) -> None:
+        def on_dismiss(result):
+            if result and self.ctx:
+                try:
+                    self.ctx.db.save_contact(result["address"], result["alias"])
+                    self.refresh_contacts()
+                    self.notify(f"✓ Added contact: {result['alias'] or result['address'][:12]}")
+                except Exception as e:
+                    self.notify(f"Failed to add contact: {e}", severity="error")
+        self.push_screen(AddContactScreen(), callback=on_dismiss)
 
-    async def action_server_settings(self) -> None:
+    def action_server_settings(self) -> None:
         if not self.ctx:
             return
+        current_url = self.ctx.server or "http://localhost:8000"
 
-        try:
-            current_url = getattr(self.ctx, 'server', 'Unknown')
-            result = await self.push_screen_wait(ServerSettingsScreen(current_url))
-
+        def on_dismiss(result):
             if result:
                 try:
                     self.ctx.server = result
-                    registry.dispatch(self.ctx, "/sync")
                     self.header_bar.status = f"Server: {result}"
                     self.notify(f"✓ Server updated: {result}")
                 except Exception as e:
                     self.notify(f"Server update failed: {e}", severity="error")
-        except Exception as e:
-            self.notify(f"Server settings failed: {e}", severity="error")
+        self.push_screen(ServerSettingsScreen(current_url), callback=on_dismiss)
 
-    async def action_new_group(self) -> None:
+    def action_new_group(self) -> None:
         if not self.ctx:
             return
 
-        result = await self.push_screen_wait(CreateGroupScreen())
-        if result:
-            try:
-                if self.ctx.db:
-                    # Minimal group creation: save a conversation entry
-                    import time
-                    self.ctx.db.execute(
-                        "INSERT OR IGNORE INTO conversations (conversation_id, type, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                        (f"group_{int(time.time())}", "group", result, int(time.time()), int(time.time())),
-                    )
-                    self.ctx.db.commit()
-                self.refresh_contacts()
-                self.notify(f"✓ Created group: {result}")
-            except Exception as e:
-                self.notify(f"Failed to create group: {e}", severity="error")
+        def on_dismiss(result):
+            if result:
+                try:
+                    # Placeholder - rooms not yet in db.py
+                    self.notify(f"✓ Group created: {result} (placeholder)")
+                    self.refresh_contacts()
+                except Exception as e:
+                    self.notify(f"Failed to create group: {e}", severity="error")
+        self.push_screen(CreateGroupScreen(), callback=on_dismiss)
 
     def action_clear_chat(self) -> None:
         chat_messages = self.query_one("#chat_messages", Vertical)
@@ -959,52 +950,50 @@ class NyxTUI(App):
             child.remove()
         self.notify("Chat display cleared")
 
-    async def action_delete_contact(self) -> None:
+    def action_delete_contact(self) -> None:
         if not self.active_contact or not self.ctx:
             return
 
         alias = self.active_contact.get('display_name') or self.active_contact.get('identity_id', '')[:12]
-        confirm = await self.push_screen_wait(
-            ConfirmDialog(
-                f"Delete contact '{alias}'?\nThis will remove all message history.",
-                title="Delete Contact"
-            )
+
+        def on_dismiss(confirm):
+            if confirm:
+                try:
+                    identity_id = self.active_contact.get('identity_id', '')
+                    if identity_id and self.ctx and self.ctx.db:
+                        self.ctx.db.execute("DELETE FROM contacts WHERE identity_id = ?", (identity_id,))
+                        self.ctx.db.commit()
+                    self.active_contact = None
+                    self.action_clear_chat()
+                    self.refresh_contacts()
+                    self.notify(f"✓ Deleted contact: {alias}")
+                except Exception as e:
+                    self.notify(f"Failed to delete contact: {e}", severity="error")
+        self.push_screen(
+            ConfirmDialog(f"Delete contact '{alias}'?\nThis will remove all message history.", title="Delete Contact"),
+            callback=on_dismiss
         )
 
-        if confirm:
-            try:
-                identity_id = self.active_contact.get('identity_id', '')
-                if identity_id and self.ctx.db:
-                    self.ctx.db.execute("DELETE FROM contacts WHERE identity_id = ?", (identity_id,))
-                    self.ctx.db.commit()
-                self.active_contact = None
-                self.action_clear_chat()
-                self.refresh_contacts()
-                self.notify(f"✓ Deleted contact: {alias}")
-            except Exception as e:
-                self.notify(f"Failed to delete contact: {e}", severity="error")
+    def action_quit_confirm(self) -> None:
+        def on_dismiss(confirm):
+            if confirm:
+                self.exit()
+        self.push_screen(ConfirmDialog("Are you sure you want to quit NYX?", title="Quit"), callback=on_dismiss)
 
-    async def action_browse_channels(self) -> None:
+    def action_browse_channels(self) -> None:
         if not self.ctx:
-            self.notify("Backend not connected", severity="error")
+            self.notify("Not connected", severity="error")
             return
         self.push_screen(BrowseChannelsScreen())
 
-    async def action_group_members(self) -> None:
-        if not self.ctx or not self.active_contact:
+    def action_group_members(self) -> None:
+        if not self.active_contact or 'room_id' not in self.active_contact:
             self.notify("No active group", severity="warning")
-            return
-        if 'room_id' not in self.active_contact:
-            self.notify("Not a group chat", severity="warning")
             return
         self.push_screen(GroupMembersScreen())
 
-    async def action_quit_confirm(self) -> None:
-        confirm = await self.push_screen_wait(
-            ConfirmDialog("Are you sure you want to quit NYX?", title="Quit")
-        )
-        if confirm:
-            self.exit()
+    def action_focus_next(self) -> None:
+        self.focus_next()
 
 
 if __name__ == "__main__":

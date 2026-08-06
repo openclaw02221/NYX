@@ -1,79 +1,71 @@
-"""
-NYX Client — Textual TUI / REPL entry point.
-"""
-
+#!/usr/bin/env python3
 import sys
 import argparse
-import asyncio
-from commands import CommandContext, registry
-from config import load_settings, configure_logging, ensure_directories, get_logger
+from pathlib import Path
+
+from config import load_settings
 from db import NYXDatabase
 from crypto import Identity
+from commands import CommandContext
 from ui import ReplUI, NyxTUI
 
 
-async def main_async() -> int:
-    parser = argparse.ArgumentParser(
-        description="NYX — Terminal-Native Secure Messaging Client"
-    )
-    parser.add_argument("--repl", action="store_true", help="use REPL UI")
-    parser.add_argument("--tui", action="store_true", help="use Textual TUI")
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(description='NYX - Secure Messaging Client')
+    parser.add_argument('--config', help='Config file path')
+    parser.add_argument('--repl', action='store_true', help='Use REPL interface')
+    parser.add_argument('--tui', action='store_true', help='Use TUI interface (default)')
     args = parser.parse_args()
-
+    
     # Load settings
-    settings = load_settings()
-    ensure_directories(settings)
-    configure_logging(level="INFO", json_logs=False)
-    log = get_logger(__name__)
-
+    settings = load_settings(args.config)
+    
     # Initialize database
     db_path = settings.storage.database_path()
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     db = NYXDatabase(db_path)
-    db.connect()
-
+    
     # Load or create identity
     identity_data = db.load_identity()
     if identity_data:
-        identity_id = identity_data["identity_id"]
-        # Use saved private key to restore identity
-        identity = Identity.from_private_bytes(identity_data["enc_identity_key"])
-        connected = True
+        identity = Identity.load(identity_data['private_key'])
+        identity_id = identity_data['id']
     else:
         identity = Identity.create()
         identity_id = identity.id
-        db.save_identity(identity_id, identity.public_key_bytes, identity.identity_key.private_bytes())
-        connected = False
-
-    log.info("identity", id=identity_id)
-
-    # Build command context
+        db.save_identity(identity_id, identity.private_key_bytes, identity.public_key_bytes)
+    
+    # Get server URL
+    server = settings.network.default_server
+    
+    # Create command context
     ctx = CommandContext(
         identity=identity,
         identity_id=identity_id,
-        server=settings.network.default_server,
-        connected=connected,
-        db=db,
+        server=server,
+        connected=False,
+        db=db
     )
+    
+    # Determine which UI to use
+    use_repl = args.repl
+    use_tui = args.tui or not args.repl  # TUI is default
+    
+    try:
+        if use_repl:
+            # Use REPL interface
+            ui = ReplUI(ctx)
+            ui.run()
+        else:
+            # Use TUI interface
+            ui = NyxTUI(ctx)
+            ui.run()
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        db.close()
 
-    # Launch chosen UI
-    if args.repl:
-        ui = ReplUI(ctx, registry)
-        return ui.run()
-    else:
-        # TUI (default when neither --repl nor --tui is specified)
-        app = NyxTUI(ctx)
-        await app.run_async()
-        return 0
 
-
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--repl":
-        # REPL mode is synchronous
-        sys.exit(asyncio.run(main_async()))
-    else:
-        # TUI mode needs to run without nested event loop
-        asyncio.run(main_async())
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

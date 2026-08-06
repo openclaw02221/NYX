@@ -9,11 +9,16 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Copy server files correctly
 COPY server/ /app/
 
-EXPOSE 8000
+# Environment variable for port, defaulting to 8000
+ENV PORT=8000
+
+EXPOSE ${PORT}
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:8000/ || exit 1
+  CMD curl -f http://localhost:${PORT}/api/health.php || exit 1
 
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-8000} /app/index.php"]
+# Start using built-in PHP server with router
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT} /app/router.php"]

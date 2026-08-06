@@ -1,363 +1,303 @@
-"""
-NYX Client Command System.
-
-All command handlers for the interactive REPL.
-Consolidated from core/commands.py, core/messaging.py, core/directory.py, core/search.py.
-"""
-
-from __future__ import annotations
-
-import shlex
-import time
-import hashlib
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
-
-import aiohttp
-
-from config import get_logger
-from crypto import Identity, aead_encrypt, aead_decrypt
-from db import NYXDatabase, Message
-
-log = get_logger(__name__)
-
-
-@dataclass
-class CommandContext:
-    """Context passed to command handlers."""
-    identity: Optional[Identity] = None
-    identity_id: Optional[str] = None
-    server: Optional[str] = None
-    connected: bool = False
-    db: Optional[NYXDatabase] = None
-    session: Optional[aiohttp.ClientSession] = None
-
+import argparse
+from dataclasses import dataclass
+from typing import Optional, Callable, Dict, Any, List
+import requests
+import json
 
 @dataclass
 class CommandResult:
-    """Result from command execution."""
+    """Result from a command execution"""
     ok: bool
     message: str
     data: Optional[Any] = None
 
-
-CommandHandler = Callable[[CommandContext, List[str]], CommandResult]
-
-
 @dataclass
-class CommandSpec:
-    """Command specification."""
-    name: str
-    handler: CommandHandler
-    help: str
-    usage: str = ""
+class CommandContext:
+    """Context passed to all commands"""
+    identity: Any  # Identity object
+    identity_id: str  # Identity ID as string
+    server: str  # Server URL
+    connected: bool  # Connection status
+    db: Any  # NYXDatabase instance
+    
+    def is_connected(self) -> bool:
+        """Check if connected to server"""
+        return self.connected
+    
+    def get_identity_id(self) -> str:
+        """Get current identity ID"""
+        return self.identity_id
+    
+    def get_server_url(self) -> str:
+        """Get current server URL"""
+        return self.server
+    
+    def update_connection_status(self, status: bool):
+        """Update connection status"""
+        self.connected = status
+
+
+class Command:
+    """Base class for commands"""
+    def __init__(self, name: str, handler: Callable, help_text: str = ""):
+        self.name = name
+        self.handler = handler
+        self.help_text = help_text
+        self.parser = argparse.ArgumentParser(
+            prog=name,
+            description=help_text,
+            add_help=False
+        )
+    
+    def execute(self, ctx: CommandContext, args: list[str]) -> str:
+        """Execute the command"""
+        try:
+            parsed = self.parser.parse_args(args)
+            return self.handler(ctx, parsed)
+        except SystemExit:
+            return f"Invalid arguments for {self.name}"
+        except Exception as e:
+            return f"Error: {str(e)}"
 
 
 class CommandRegistry:
-    """Registry of available commands."""
-
-    def __init__(self) -> None:
-        self._commands: Dict[str, CommandSpec] = {}
-
-    def register(self, name: str, help: str, usage: str = ""):
-        """Decorator to register a command."""
-        def decorator(fn: CommandHandler) -> CommandHandler:
-            self._commands[name] = CommandSpec(
-                name=name, handler=fn, help=help, usage=usage or ("/" + name)
-            )
-            return fn
-        return decorator
-
-    def get(self, name: str) -> Optional[CommandSpec]:
-        """Get command spec by name."""
-        return self._commands.get(name)
-
-    def list_commands(self) -> List[CommandSpec]:
-        """List all registered commands."""
-        return sorted(self._commands.values(), key=lambda c: c.name)
-
+    """Registry for all commands"""
+    def __init__(self):
+        self.commands: Dict[str, Command] = {}
+    
+    def register(self, name: str, handler: Callable, help_text: str = ""):
+        """Register a command"""
+        cmd = Command(name, handler, help_text)
+        self.commands[name] = cmd
+        return cmd
+    
+    def get(self, name: str) -> Optional[Command]:
+        """Get a command by name"""
+        return self.commands.get(name)
+    
+    def list_commands(self) -> list[str]:
+        """List all registered commands"""
+        return list(self.commands.keys())
+    
+    def execute(self, ctx: CommandContext, command: str, args: list[str]) -> str:
+        """Execute a command"""
+        cmd = self.get(command)
+        if not cmd:
+            return f"Unknown command: {command}"
+        return cmd.execute(ctx, args)
+    
     def dispatch(self, ctx: CommandContext, line: str) -> CommandResult:
-        """Parse and execute a command line."""
+        """Parse and dispatch a command line (for ui.py compatibility)"""
         line = line.strip()
         if not line:
             return CommandResult(ok=True, message="")
         
         if not line.startswith("/"):
-            return CommandResult(
-                ok=False,
-                message="Commands start with /. Type /help for a list.",
-            )
+            return CommandResult(ok=False, message="Commands must start with /")
         
-        try:
-            parts = shlex.split(line[1:])
-        except ValueError as exc:
-            return CommandResult(ok=False, message="parse error: " + str(exc))
-        
+        # Remove leading / and split
+        parts = line[1:].split(None, 1)
         if not parts:
-            return CommandResult(ok=False, message="empty command")
+            return CommandResult(ok=False, message="Empty command")
         
-        name = parts[0].lower()
-        args = parts[1:]
+        command = parts[0].lower()
+        args = parts[1].split() if len(parts) > 1 else []
         
-        if name in ("help", "?"):
-            return self._help(args)
+        # Handle special exit/quit commands
+        if command in ("exit", "quit"):
+            return CommandResult(ok=True, message="EXIT")
         
-        spec = self._commands.get(name)
-        if spec is None:
-            return CommandResult(ok=False, message="unknown command: /" + name)
+        # Execute command
+        result_message = self.execute(ctx, command, args)
         
-        if args and args[0] in ("--help", "-h"):
-            return CommandResult(
-                ok=True,
-                message=f"/{spec.name} - {spec.help}\nUsage: {spec.usage}",
-            )
+        # Check if result indicates exit
+        if result_message == "QUIT":
+            return CommandResult(ok=True, message="EXIT")
         
-        try:
-            return spec.handler(ctx, args)
-        except Exception as e:
-            log.exception("command.error", command=name)
-            return CommandResult(ok=False, message="error: " + str(e))
-
-    def _help(self, args: List[str]) -> CommandResult:
-        """Show help for commands."""
-        if args:
-            key = args[0].lstrip("/").lower()
-            spec = self._commands.get(key)
-            if spec is None:
-                return CommandResult(ok=False, message="unknown: " + args[0])
-            return CommandResult(
-                ok=True,
-                message=f"/{spec.name} - {spec.help}\nUsage: {spec.usage}",
-            )
-        
-        lines = ["Available commands:", ""]
-        for spec in self.list_commands():
-            lines.append(f"  /{spec.name:<12} {spec.help}")
-        lines.append("")
-        lines.append("Type /help <command> for details.")
-        return CommandResult(ok=True, message="\n".join(lines))
+        # Return result
+        is_error = result_message.startswith("Error:") or result_message.startswith("Unknown command")
+        return CommandResult(ok=not is_error, message=result_message)
 
 
 # Global registry
 registry = CommandRegistry()
 
-# Export for type hints
-__all__ = [
-    "CommandContext",
-    "CommandResult",
-    "CommandRegistry",
-    "registry",
-]
+
+# Command handlers
+def cmd_help(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Show help"""
+    commands = registry.list_commands()
+    return "Available commands:\n" + "\n".join(f"  {cmd}" for cmd in sorted(commands))
 
 
-# =============================================================================
-# Command Implementations
-# =============================================================================
-
-@registry.register("exit", "Exit the client", "/exit")
-def cmd_exit(ctx: CommandContext, args: List[str]) -> CommandResult:
-    return CommandResult(ok=True, message="__EXIT__")
-
-
-@registry.register("quit", "Exit the client", "/quit")
-def cmd_quit(ctx: CommandContext, args: List[str]) -> CommandResult:
-    return CommandResult(ok=True, message="__EXIT__")
-
-
-@registry.register("status", "Show connection and identity status", "/status")
-def cmd_status(ctx: CommandContext, args: List[str]) -> CommandResult:
-    lines = [
-        "Identity : " + (ctx.identity_id or "(none)"),
-        "Server   : " + (ctx.server or "(none)"),
-        "Connected: " + ("yes" if ctx.connected else "no"),
-    ]
-    return CommandResult(ok=True, message="\n".join(lines))
+def cmd_connect(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Connect to server"""
+    try:
+        response = requests.get(f"{ctx.server}/api/v3/health", timeout=5)
+        if response.status_code == 200:
+            ctx.update_connection_status(True)
+            return f"Connected to {ctx.server}"
+        return f"Failed to connect: {response.status_code}"
+    except Exception as e:
+        ctx.update_connection_status(False)
+        return f"Connection failed: {str(e)}"
 
 
-@registry.register("identity", "Show local identity", "/identity")
-def cmd_identity(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not ctx.identity_id:
-        return CommandResult(ok=False, message="no identity loaded")
-    return CommandResult(ok=True, message="Identity: " + ctx.identity_id)
-
-
-@registry.register("contacts", "List all contacts", "/contacts")
-def cmd_contacts(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
+def cmd_register(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Register identity on server"""
+    if not ctx.is_connected():
+        return "Not connected. Use /connect first."
     
+    try:
+        public_key = ctx.identity.public_key_bytes.hex()
+        data = {
+            'identity_id': ctx.identity_id,
+            'public_key': public_key
+        }
+        response = requests.post(
+            f"{ctx.server}/register.php",
+            json=data,
+            timeout=10
+        )
+        if response.status_code == 200:
+            return "Registration successful"
+        return f"Registration failed: {response.text}"
+    except Exception as e:
+        return f"Registration error: {str(e)}"
+
+
+def cmd_contacts(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """List contacts"""
     contacts = ctx.db.list_contacts()
     if not contacts:
-        return CommandResult(ok=True, message="(no contacts)")
+        return "No contacts"
     
-    lines = ["Contacts:"]
+    result = ["Contacts:"]
     for contact in contacts:
-        name = contact.get("display_name") or "(unnamed)"
-        identity = contact.get("identity_id", "")[:24]
-        lines.append(f"  {name:<20} {identity}...")
-    
-    return CommandResult(ok=True, message="\n".join(lines))
+        result.append(f"  {contact['name']} ({contact['identity_id']})")
+    return "\n".join(result)
 
 
-@registry.register("add", "Add a contact", "/add <identity> [name]")
-def cmd_add_contact(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
+def cmd_add_contact(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Add a contact"""
+    if not args.name or not args.identity_id:
+        return "Usage: /add <name> <identity_id>"
     
-    if not args:
-        return CommandResult(ok=False, message="Usage: /add <identity> [name]")
-    
-    identity_id = args[0]
-    display_name = " ".join(args[1:]) if len(args) > 1 else ""
-    
-    ctx.db.save_contact(identity_id, display_name)
-    return CommandResult(ok=True, message=f"Added contact: {display_name or identity_id[:24]}")
+    ctx.db.save_contact(args.name, args.identity_id, args.public_key or "")
+    return f"Added contact: {args.name}"
 
 
-@registry.register("dm", "Send or view direct message", "/dm <identity> [message]")
-def cmd_dm(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not args:
-        return CommandResult(ok=False, message="Usage: /dm <identity> [message]")
-    
-    if not ctx.db or not ctx.identity_id:
-        return CommandResult(ok=False, message="not initialized")
-    
-    peer_id = args[0]
-    conversation_id = _conversation_id(ctx.identity_id, peer_id)
-    
-    # View history if no message provided
-    if len(args) == 1:
-        messages = ctx.db.get_messages(conversation_id, limit=20)
-        if not messages:
-            return CommandResult(ok=True, message=f"(no messages with {peer_id[:24]})")
-        
-        lines = []
-        for msg in messages:
-            arrow = "->" if msg.direction == "out" else "<-"
-            try:
-                text = msg.payload.decode("utf-8", errors="replace")
-            except:
-                text = "[encrypted]"
-            lines.append(f"  {arrow} [{msg.sequence}] {text}")
-        
-        return CommandResult(ok=True, message="\n".join(lines))
-    
-    # Send message
-    text = " ".join(args[1:])
-    message_id = hashlib.sha256(f"{ctx.identity_id}{peer_id}{time.time()}".encode()).hexdigest()[:32]
-    
-    ctx.db.ensure_conversation(conversation_id, peer_id)
-    
-    # Get next sequence number
-    existing = ctx.db.get_messages(conversation_id, limit=1)
-    sequence = (existing[0].sequence + 1) if existing else 1
-    
-    # Save message
-    message = Message(
-        message_id=message_id,
-        conversation_id=conversation_id,
-        sender_id=ctx.identity_id,
-        payload=text.encode("utf-8"),
-        sequence=sequence,
-        timestamp=int(time.time()),
-        direction="out",
-        status="sent",
-    )
-    ctx.db.save_message(message)
-    
-    return CommandResult(ok=True, message=f"Sent message to {peer_id[:24]}")
-
-
-@registry.register("conversations", "List all conversations", "/conversations")
-def cmd_conversations(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
-    
+def cmd_conversations(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """List conversations"""
     convs = ctx.db.list_conversations()
     if not convs:
-        return CommandResult(ok=True, message="(no conversations)")
+        return "No conversations"
     
-    lines = ["Conversations:"]
+    result = ["Conversations:"]
     for conv in convs:
-        peer = conv.get("peer_id", "")[:24]
-        last_seq = conv.get("last_sequence", 0)
-        lines.append(f"  {peer}... (seq: {last_seq})")
+        result.append(f"  {conv['conversation_id']}: {conv['participant_count']} participants")
+    return "\n".join(result)
+
+
+def cmd_send(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Send a message"""
+    if not args.recipient or not args.message:
+        return "Usage: /send <recipient_id> <message>"
     
-    return CommandResult(ok=True, message="\n".join(lines))
-
-
-@registry.register("sync", "Sync messages from server", "/sync")
-def cmd_sync(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not ctx.server or not ctx.identity_id:
-        return CommandResult(ok=False, message="not connected")
+    if not ctx.is_connected():
+        return "Not connected. Use /connect first."
     
-    # Simplified sync - would normally fetch from server
-    return CommandResult(ok=True, message="Sync complete (no new messages)")
+    try:
+        # Ensure conversation exists
+        conv_id = ctx.db.ensure_conversation([ctx.identity_id, args.recipient])
+        
+        # Save message locally
+        ctx.db.save_message(conv_id, ctx.identity_id, args.recipient, args.message)
+        
+        # Send to server
+        data = {
+            'from_id': ctx.identity_id,
+            'to_id': args.recipient,
+            'content': args.message
+        }
+        response = requests.post(
+            f"{ctx.server}/send.php",
+            json=data,
+            timeout=10
+        )
+        if response.status_code == 200:
+            return f"Message sent to {args.recipient}"
+        return f"Send failed: {response.text}"
+    except Exception as e:
+        return f"Send error: {str(e)}"
 
 
-@registry.register("create_group", "Create a new group", "/create_group <name>")
-def cmd_create_group(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not args:
-        return CommandResult(ok=False, message="Usage: /create_group <name>")
+def cmd_messages(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Show messages"""
+    if not args.conversation_id:
+        return "Usage: /messages <conversation_id>"
     
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
-
-    name = args[0]
-    room_id = hashlib.sha256(f"group{name}{time.time()}".encode()).hexdigest()[:32]
+    messages = ctx.db.get_messages(args.conversation_id)
+    if not messages:
+        return f"No messages in conversation {args.conversation_id}"
     
-    now = int(time.time())
-    ctx.db.execute(
-        """INSERT INTO conversations (conversation_id, type, title, created_at, updated_at)
-           VALUES (?, 'group', ?, ?, ?)""",
-        (room_id, name, now, now)
-    )
-    ctx.db.commit()
+    result = [f"Messages in {args.conversation_id}:"]
+    for msg in messages:
+        result.append(f"  [{msg['timestamp']}] {msg['from_id']}: {msg['content']}")
+    return "\n".join(result)
+
+
+def cmd_sync(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Sync messages from server"""
+    if not ctx.is_connected():
+        return "Not connected. Use /connect first."
     
-    return CommandResult(ok=True, message=f"Created group: {name}", data={"room_id": room_id})
+    try:
+        response = requests.post(
+            f"{ctx.server}/sync.php",
+            json={'identity_id': ctx.identity_id},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            count = len(data.get('messages', []))
+            return f"Synced {count} messages"
+        return f"Sync failed: {response.text}"
+    except Exception as e:
+        return f"Sync error: {str(e)}"
 
 
-@registry.register("delete_contact", "Delete a contact", "/delete_contact <identity>")
-def cmd_delete_contact(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not args:
-        return CommandResult(ok=False, message="Usage: /delete_contact <identity>")
-    
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
-
-    identity_id = args[0]
-    ctx.db.execute("DELETE FROM contacts WHERE identity_id = ?", (identity_id,))
-    ctx.db.commit()
-    
-    return CommandResult(ok=True, message=f"Deleted contact: {identity_id}")
+def cmd_status(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Show status"""
+    status = "connected" if ctx.is_connected() else "disconnected"
+    return f"Identity: {ctx.identity_id}\nServer: {ctx.server}\nStatus: {status}"
 
 
-@registry.register("delete_group", "Delete or leave a group", "/delete_group <room_id>")
-def cmd_delete_group(ctx: CommandContext, args: List[str]) -> CommandResult:
-    if not args:
-        return CommandResult(ok=False, message="Usage: /delete_group <room_id>")
-    
-    if not ctx.db:
-        return CommandResult(ok=False, message="database not available")
-
-    room_id = args[0]
-    ctx.db.execute("DELETE FROM conversations WHERE conversation_id = ? AND type = 'group'", (room_id,))
-    ctx.db.commit()
-    
-    return CommandResult(ok=True, message=f"Left group: {room_id}")
+def cmd_quit(ctx: CommandContext, args: argparse.Namespace) -> str:
+    """Quit the application"""
+    return "QUIT"
 
 
-@registry.register("clear", "Clear screen", "/clear")
-def cmd_clear(ctx: CommandContext, args: List[str]) -> CommandResult:
-    print("\033[2J\033[H", end="")  # ANSI clear screen
-    return CommandResult(ok=True, message="")
+# Register commands
+registry.register("help", cmd_help, "Show help")
+registry.register("connect", cmd_connect, "Connect to server")
+registry.register("register", cmd_register, "Register on server")
+registry.register("contacts", cmd_contacts, "List contacts")
+registry.register("conversations", cmd_conversations, "List conversations")
+registry.register("status", cmd_status, "Show status")
+registry.register("sync", cmd_sync, "Sync messages")
+registry.register("quit", cmd_quit, "Quit")
+registry.register("exit", cmd_quit, "Exit")
 
+# Register commands that need argument configuration
+cmd_add = registry.register("add", cmd_add_contact, "Add contact")
+cmd_add.parser.add_argument("name", help="Contact name")
+cmd_add.parser.add_argument("identity_id", help="Contact identity ID")
+cmd_add.parser.add_argument("--public-key", dest="public_key", help="Public key")
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
+cmd_send = registry.register("send", cmd_send, "Send message")
+cmd_send.parser.add_argument("recipient", help="Recipient identity ID")
+cmd_send.parser.add_argument("message", nargs="+", help="Message to send")
 
-def _conversation_id(id1: str, id2: str) -> str:
-    """Generate deterministic conversation ID from two identities."""
-    sorted_ids = tuple(sorted([id1, id2]))
-    return hashlib.sha256(f"{sorted_ids[0]}{sorted_ids[1]}".encode()).hexdigest()[:32]
+cmd_messages = registry.register("messages", cmd_messages, "Show messages")
+cmd_messages.parser.add_argument("conversation_id", help="Conversation ID")
